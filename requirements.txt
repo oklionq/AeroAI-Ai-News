@@ -7,3 +7,4 @@ openai>=1.14.2
 APScheduler>=3.10.4
 pydantic>=2.6.4
 python-dotenv>=1.0.1
+cloudscraper>=1.2.71
