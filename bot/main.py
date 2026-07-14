@@ -9,14 +9,22 @@ from bot.pipeline.collector import run_collector
 from bot.pipeline.filter_stage import run_filter_stage
 from bot.pipeline.generator_stage import run_generator_stage
 from bot.utils.logger import logger
+from bot.pipeline.cycle_tracker import CycleTracker
 
 async def tick(bot: Bot):
     try:
-        await run_collector()
-        await run_filter_stage()
-        await run_generator_stage(bot)
+        tracker = await CycleTracker.start_cycle()
+        try:
+            await run_collector(tracker)
+            await run_filter_stage(tracker)
+            await run_generator_stage(bot, tracker)
+            await tracker.finish_cycle(status="success")
+        except Exception as e:
+            logger.error(f"Error in pipeline stages: {e}")
+            await tracker.add_error(f"Pipeline error: {str(e)}")
+            await tracker.finish_cycle(status="partial_failure")
     except Exception as e:
-        logger.error(f"Error in pipeline tick: {e}")
+        logger.error(f"Error starting pipeline tick: {e}")
 
 async def reset_monthly_budget():
     from bot.db import get_db_connection
@@ -37,6 +45,9 @@ async def main():
 
     logger.info("Initializing DB...")
     await init_db()
+    
+    logger.info("Cleaning up hung cycles...")
+    await CycleTracker.cleanup_hung_cycles()
     
     bot = Bot(token=config.telegram_bot_token)
     

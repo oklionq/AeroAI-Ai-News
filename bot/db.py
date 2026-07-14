@@ -90,6 +90,27 @@ async def init_db():
             )
         """)
         
+        # poll_cycles table
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS poll_cycles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at DATETIME,
+                finished_at DATETIME,
+                duration_seconds INTEGER,
+                sources_total INTEGER DEFAULT 0,
+                sources_ok INTEGER DEFAULT 0,
+                sources_failed INTEGER DEFAULT 0,
+                items_raw INTEGER DEFAULT 0,
+                items_after_dedup INTEGER DEFAULT 0,
+                items_passed_filter INTEGER DEFAULT 0,
+                items_sent_moderation INTEGER DEFAULT 0,
+                items_auto_published INTEGER DEFAULT 0,
+                errors_count INTEGER DEFAULT 0,
+                last_errors_json TEXT,
+                status TEXT
+            )
+        """)
+        
         # Insert initial bot state if not exists
         await db.execute("""
             INSERT OR IGNORE INTO bot_state (id, is_paused, budget_spent_usd) 

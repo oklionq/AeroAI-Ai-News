@@ -3,8 +3,7 @@ from bot.services.openai_client import get_filter_decision
 from bot.services.budget_guard import check_budget
 from bot.utils.logger import logger
 import asyncio
-
-async def run_filter_stage():
+async def run_filter_stage(tracker=None):
     if not await check_budget():
         logger.info("Budget exceeded. Skipping filter stage.")
         return
@@ -58,4 +57,9 @@ async def run_filter_stage():
                 await db.execute("""
                     UPDATE news_items SET status = 'error', updated_at = CURRENT_TIMESTAMP WHERE id = ?
                 """, (item_id,))
+                if tracker:
+                    await tracker.add_error(f"Filter LLM error for item {item_id}")
             await db.commit()
+            
+            if decision and new_status == 'pending_generation' and tracker:
+                await tracker.add_items_passed_filter(1)

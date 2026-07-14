@@ -18,6 +18,7 @@ class Settings(BaseModel):
     database_url: str = ""
     max_news_age_hours: int = 72
     topic_dedup_days: int = 14
+    display_timezone: str = "Europe/Riga"
 
 def load_config() -> Settings:
     from dotenv import load_dotenv
@@ -39,7 +40,8 @@ def load_config() -> Settings:
             poll_interval_minutes=int(os.getenv("POLL_INTERVAL_MINUTES", "15")),
             database_url=os.getenv("DATABASE_URL", ""),
             max_news_age_hours=int(os.getenv("MAX_NEWS_AGE_HOURS", "72")),
-            topic_dedup_days=int(os.getenv("TOPIC_DEDUP_DAYS", "14"))
+            topic_dedup_days=int(os.getenv("TOPIC_DEDUP_DAYS", "14")),
+            display_timezone=os.getenv("DISPLAY_TIMEZONE", "Europe/Riga")
         )
         return settings
     except KeyError as e:

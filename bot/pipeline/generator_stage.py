@@ -4,8 +4,7 @@ from bot.services.budget_guard import check_budget
 from bot.pipeline.images import fetch_og_image, fetch_reddit_image
 from bot.utils.logger import logger
 import datetime
-
-async def run_generator_stage(bot_instance):
+async def run_generator_stage(bot_instance, tracker=None):
     if not await check_budget():
         return
         
@@ -69,6 +68,8 @@ async def run_generator_stage(bot_instance):
             async with get_db_connection() as db:
                 await db.execute("UPDATE news_items SET status = 'error' WHERE id = ?", (item_id,))
                 await db.commit()
+            if tracker:
+                await tracker.add_error(f"Generator LLM error for item {item_id}")
             continue
             
         status = 'pending_review'
@@ -115,6 +116,10 @@ async def run_generator_stage(bot_instance):
         if auto_published:
             from bot.telegram.admin_commands import send_auto_published_to_group
             await send_auto_published_to_group(bot_instance, item_id, category, url, post.post_html, image_url)
+            if tracker:
+                await tracker.add_items_auto_published(1)
         elif status == 'pending_review':
             from bot.telegram.handlers import send_draft_to_admin
             await send_draft_to_admin(bot_instance, item_id, post.post_html, image_url)
+            if tracker:
+                await tracker.add_items_sent_moderation(1)

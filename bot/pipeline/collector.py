@@ -8,7 +8,7 @@ from bot.config import config
 import asyncio
 from datetime import datetime
 
-async def run_collector():
+async def run_collector(tracker=None):
     logger.info("Starting collector cycle.")
     
     async with get_db_connection() as db:
@@ -22,6 +22,9 @@ async def run_collector():
         
         async with db.execute("SELECT id, name, type, url FROM sources WHERE enabled = 1") as cursor:
             sources = await cursor.fetchall()
+            
+    if tracker:
+        await tracker.set_sources_total(len(sources))
             
     all_items = []
     
@@ -38,12 +41,20 @@ async def run_collector():
                 continue
                 
             all_items.extend(items)
+            if tracker:
+                await tracker.add_source_ok()
         except Exception as e:
             logger.error(f"Collector error for {s_name}: {e}")
+            if tracker:
+                await tracker.add_source_failed()
+                await tracker.add_error(f"Source {s_name} ({s_type}): {e}")
             
-    await save_new_items(all_items)
+    if tracker:
+        await tracker.add_items_raw(len(all_items))
+        
+    await save_new_items(all_items, tracker)
 
-async def save_new_items(items: list[dict]):
+async def save_new_items(items: list[dict], tracker=None):
     async with get_db_connection() as db:
         # Load recent items for deduplication
         recent_records = []
@@ -107,4 +118,7 @@ async def save_new_items(items: list[dict]):
             new_count += 1
             
         await db.commit()
+        if tracker:
+            await tracker.add_items_after_dedup(new_count)
+            
         logger.info(f"Collector finished. Inserted {new_count} new items.")

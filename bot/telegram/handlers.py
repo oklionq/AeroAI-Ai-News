@@ -103,9 +103,107 @@ async def cmd_queue(message: types.Message):
         await message.answer("Очередь пуста.")
         return
         
+    from zoneinfo import ZoneInfo
+    from datetime import datetime, timezone
+    tz = ZoneInfo(config.display_timezone)
+    
     text = "<b>Очередь модерации:</b>\n\n"
     for title, collected_at in items:
-        text += f"— {title} <i>({collected_at})</i>\n"
+        try:
+            dt = datetime.strptime(collected_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            local_time = dt.astimezone(tz).strftime("%d.%m.%Y %H:%M:%S")
+        except:
+            local_time = collected_at
+        text += f"— {title} <i>({local_time})</i>\n"
+        
+    await message.answer(text, parse_mode="HTML")
+
+@dp.message(Command("cycle"))
+@dp.message(Command("parsing"))
+@dp.message(F.text == "🔄 Парсинг")
+async def cmd_cycle(message: types.Message):
+    if message.from_user.id != config.admin_chat_id:
+        return
+        
+    async with get_db_connection() as db:
+        async with db.execute("SELECT is_paused, next_poll_at FROM bot_state WHERE id = 1") as cur:
+            state_row = await cur.fetchone()
+            is_paused = state_row[0] if state_row else 0
+            next_poll_at_str = state_row[1] if state_row else None
+            
+        async with db.execute("""
+            SELECT started_at, finished_at, duration_seconds, sources_total, sources_ok, sources_failed,
+                   items_raw, items_after_dedup, items_passed_filter, items_sent_moderation, items_auto_published,
+                   errors_count, last_errors_json, status
+            FROM poll_cycles
+            ORDER BY id DESC LIMIT 1
+        """) as cur:
+            cycle_row = await cur.fetchone()
+            
+    from zoneinfo import ZoneInfo
+    from datetime import datetime, timezone
+    tz = ZoneInfo(config.display_timezone)
+    
+    def format_time(t_str):
+        if not t_str: return "неизвестно"
+        try:
+            dt = datetime.strptime(t_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            return dt.astimezone(tz).strftime("%d.%m.%Y %H:%M:%S")
+        except:
+            return t_str
+            
+    def format_relative(t_str):
+        if not t_str: return ""
+        try:
+            dt = datetime.strptime(t_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            diff = (dt - datetime.now(timezone.utc)).total_seconds()
+            if diff <= 0: return "уже скоро"
+            mins = int(diff / 60)
+            if mins == 0: return "меньше минуты"
+            return f"~{mins} минут"
+        except:
+            return ""
+
+    if not cycle_row:
+        next_time = format_time(next_poll_at_str)
+        await message.answer(f"Циклов парсинга пока не было — первый запланирован на {next_time}")
+        return
+        
+    (started_at, finished_at, duration, sources_total, sources_ok, sources_failed,
+     items_raw, items_after_dedup, items_passed_filter, items_sent_moderation, items_auto_published,
+     errors_count, last_errors_json, status) = cycle_row
+     
+    if status == 'running':
+        await message.answer(
+            f"⏳ Цикл парсинга выполняется сейчас\nНачат: {format_time(started_at)}"
+        )
+        return
+        
+    text = f"🔄 <b>Последний цикл парсинга</b>\n\n"
+    text += f"Завершён: {format_time(finished_at)}\n"
+    text += f"Длительность: {duration} сек\n\n"
+    text += f"Источники: {sources_ok}/{sources_total} успешно\n"
+    text += f"Новых записей найдено: {items_raw}\n"
+    text += f"После проверки на дубли: {items_after_dedup}\n"
+    text += f"Прошло фильтр важности: {items_passed_filter}\n"
+    text += f"Отправлено на модерацию: {items_sent_moderation}\n"
+    text += f"Авто-опубликовано: {items_auto_published}\n"
+    text += f"Ошибок за цикл: {errors_count}"
+    
+    if errors_count > 0 and last_errors_json:
+        import json
+        try:
+            errs = json.loads(last_errors_json)
+            if errs:
+                text += "\n\n<i>Ошибки:</i>\n" + "\n".join([f"— {e}" for e in errs])
+        except:
+            pass
+            
+    text += "\n\n"
+    if is_paused:
+        text += "⏸ Агент на паузе — следующий цикл не запланирован. Возобновить: /resume"
+    else:
+        text += f"⏭ Следующий цикл: {format_time(next_poll_at_str)} (через {format_relative(next_poll_at_str)})"
         
     await message.answer(text, parse_mode="HTML")
 
@@ -123,7 +221,18 @@ async def cmd_pause_resume(message: types.Message):
         new_state = not is_paused
         reason = 'manual' if new_state else None
         
-        await db.execute("UPDATE bot_state SET is_paused = ?, pause_reason = ? WHERE id = 1", (new_state, reason))
+        if new_state:
+            # Paused
+            await db.execute("UPDATE bot_state SET is_paused = ?, pause_reason = ?, next_poll_at = NULL WHERE id = 1", (new_state, reason))
+        else:
+            # Resumed
+            from datetime import datetime, timezone
+            import datetime as dt
+            now = datetime.now(timezone.utc)
+            next_poll_at = now + dt.timedelta(minutes=config.poll_interval_minutes)
+            next_poll_at_str = next_poll_at.strftime("%Y-%m-%d %H:%M:%S")
+            await db.execute("UPDATE bot_state SET is_paused = ?, pause_reason = ?, next_poll_at = ? WHERE id = 1", (new_state, reason, next_poll_at_str))
+            
         await db.commit()
         
     if new_state:
