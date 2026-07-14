@@ -17,7 +17,7 @@ async def fetch_rss(source_id: int, source_name: str, url: str) -> list[dict]:
         for entry in feed.entries:
             published_parsed = entry.get("published_parsed") or entry.get("updated_parsed")
             if published_parsed:
-                published_at = datetime.fromtimestamp(time.mktime(published_parsed))
+                published_at = datetime(*published_parsed[:6])
             else:
                 published_at = None
                 

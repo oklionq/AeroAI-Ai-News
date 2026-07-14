@@ -26,6 +26,15 @@ async def reset_monthly_budget():
     logger.info("Monthly budget reset applied.")
 
 async def main():
+    import os
+    if os.getenv("RAILWAY_ENVIRONMENT") and not config.database_url:
+        logger.warning("=" * 60)
+        logger.warning("CRITICAL WARNING: Running in Railway without DATABASE_URL set!")
+        logger.warning("Your database (data/bot.db) will be LOST on every redeploy.")
+        logger.warning("Please create a Volume in Railway, mount it to /data, and")
+        logger.warning("set the environment variable DATABASE_URL=/data/bot.db")
+        logger.warning("=" * 60)
+
     logger.info("Initializing DB...")
     await init_db()
     
