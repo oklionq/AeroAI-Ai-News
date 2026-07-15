@@ -285,3 +285,34 @@ async def send_auto_published_to_group(bot: Bot, item_id: int, category: str, ur
         
     except Exception as e:
         logger.error(f"Auto-publishing failed for item {item_id}: {e}")
+
+@dp.message(Command("testpost"))
+async def cmd_testpost(message: types.Message, bot: Bot):
+    if message.from_user.id != config.admin_chat_id:
+        return
+        
+    await message.answer("Создаю тестовый пост...")
+    
+    from bot.telegram.handlers import send_draft_to_admin
+    
+    test_title = "Тестовая новость для проверки публикации"
+    test_url = "https://example.com/test-news"
+    test_url_hash = "testhash123"
+    test_title_hash = "testhash123"
+    test_summary = "Это тестовое саммари новости."
+    test_post_text = "<b>Тестовая новость для проверки публикации</b>\n\nЭто сгенерированный тестовый текст. Если вы нажмете «Опубликовать», он должен попасть в нужную тему (например, AI Новости с ID 13).\n\n<a href='https://example.com/test-news'>Читать далее</a>"
+    
+    async with get_db_connection() as db:
+        async with db.execute("SELECT id FROM sources LIMIT 1") as cur:
+            row = await cur.fetchone()
+            source_id = row[0] if row else 1
+            
+        cursor = await db.execute("""
+            INSERT INTO news_items (source_id, url, url_hash, title_hash, title, summary, status, filter_category, post_text_json)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending_review', 'other', ?)
+        """, (source_id, test_url, test_url_hash, test_title_hash, test_title, test_summary, test_post_text))
+        item_id = cursor.lastrowid
+        await db.commit()
+        
+    await send_draft_to_admin(bot, item_id, test_post_text, None)
+
