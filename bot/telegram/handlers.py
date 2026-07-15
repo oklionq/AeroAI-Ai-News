@@ -285,10 +285,8 @@ async def on_review_action(callback: types.CallbackQuery, bot: Bot):
         thread_id = config.topic_mapping.get(category, None)
         
         if thread_id is None:
-            err_msg = f"Не настроена тема для категории '{category}' в TOPIC_MAPPING!"
-            logger.error(err_msg)
-            await callback.answer(err_msg, show_alert=True)
-            return
+            thread_id = config.default_topic_id
+            logger.info(f"Категория '{category}' не найдена в TOPIC_MAPPING. Используем DEFAULT_TOPIC_ID ({thread_id}).")
         
         if image_url and len(post_text) > 1024:
             image_url = None

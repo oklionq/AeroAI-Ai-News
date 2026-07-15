@@ -72,10 +72,48 @@ async def get_filter_decision(title: str, summary: str, news_item_id: int) -> Fi
             logger.error(f"OpenAI filter retry failed for item {news_item_id}: {retry_e}")
             return None
 
-async def generate_post_text(title: str, summary: str, source_name: str, news_item_id: int, url: str, retry_format: bool = False) -> GeneratedPost | None:
+async def _check_and_fix_grammar(post_html: str) -> str:
+    import re
+    match = re.search(r'<b>(.*?)</b>', post_html)
+    if not match:
+        return post_html
+        
+    full_title = match.group(1)
+    grammar_prompt = "Проверь этот короткий заголовок на грамматическое согласование рода и падежа. Если ошибок нет — верни его без изменений. Если есть — верни исправленный вариант. Внимание: в начале заголовка может быть эмодзи, сохрани его. Не добавляй пояснений, только заголовок."
+    try:
+        grammar_resp = await client.chat.completions.create(
+            model=config.filter_model,
+            messages=[
+                {"role": "system", "content": grammar_prompt},
+                {"role": "user", "content": full_title}
+            ],
+            max_tokens=100
+        )
+        fixed_title = grammar_resp.choices[0].message.content.strip()
+        if fixed_title and fixed_title != full_title:
+            logger.info(f"Грамматическое исправление: '{full_title}' -> '{fixed_title}'")
+            return post_html.replace(f"<b>{full_title}</b>", f"<b>{fixed_title}</b>")
+    except Exception as e:
+        logger.error(f"Grammar check error: {e}")
+        
+    return post_html
+
+async def generate_post_text(title: str, summary: str, source_name: str, news_item_id: int, url: str, retry_format: bool = False, category: str = "other") -> GeneratedPost | None:
     model = config.generation_model
     prompt = f"Source: {source_name}\nURL: {url}\nTitle: {title}\n\nContent: {summary}"
     
+    gender_rules = ""
+    if category == "model_release":
+        gender_rules = "\nОПОРНОЕ СЛОВО для заголовка: 'модель' (женский род). ВСЕ элементы заголовка (глагол, прилагательные) должны быть согласованы с женским родом, даже если само слово 'модель' не произносится. Пример правильно: 'Вышла первая открытая модель от X'. Пример НЕПРАВИЛЬНО: 'Вышел первый открытый модель от X'."
+    elif category == "feature_update":
+        gender_rules = "\nОПОРНОЕ СЛОВО для заголовка: 'функция' (ж.р.) или 'обновление' (ср.р.). Выбери одно и строго согласуй весь заголовок с его родом."
+    elif category in ["benchmark_comparison", "competitive_intel"]:
+        gender_rules = "\nОПОРНОЕ СЛОВО для заголовка: 'тест' (м.р.) или 'сравнение' (ср.р.). Строго согласуй весь заголовок с его родом."
+    elif category == "pricing_or_availability":
+        gender_rules = "\nОПОРНОЕ СЛОВО для заголовка: 'цена' (ж.р.) или 'тариф' (м.р.). Строго согласуй весь заголовок с его родом."
+    elif category == "regulatory_or_political":
+        gender_rules = "\nОПОРНОЕ СЛОВО для заголовка: 'закон' (м.р.) или 'регулирование' (ср.р.). Строго согласуй весь заголовок с его родом."
+
     system_prompt = """
 You are a dry, expert AI news writer. Write a Telegram post. Format EXACTLY as below, including all HTML tags:
 
@@ -95,8 +133,7 @@ You are a dry, expert AI news writer. Write a Telegram post. Format EXACTLY as b
 You must return strictly valid HTML. If a fact lacks concrete details in the source, DO NOT include it. Do not make up facts!
 Ensure characters <, >, and & in the text itself are escaped so they don't break HTML formatting. DO NOT escape apostrophes (') or quotes (") as &apos; or &quot; - use the symbols directly.
 CRITICAL RULE: NEVER invent, guess, or hallucinate dates, numbers, or names that are not explicitly present in the provided source text. If a date or number is not in the source, simply do not mention it.
-CRITICAL RULE FOR REDDIT SOURCES: Reddit posts are community discussions, not confirmed facts. If the Reddit post contains a direct link to an official source (press release, blog, tweet), use facts ONLY from that official link's context if available. If there is no official link, DO NOT publish specific numbers or dates as confirmed facts; only write what is explicitly stated in the text without making up specifics.
-"""
+CRITICAL RULE FOR REDDIT SOURCES: Reddit posts are community discussions, not confirmed facts. If the Reddit post contains a direct link to an official source (press release, blog, tweet), use facts ONLY from that official link's context if available. If there is no official link, DO NOT publish specific numbers or dates as confirmed facts; only write what is explicitly stated in the text without making up specifics.""" + gender_rules
     if retry_format:
         system_prompt += "\nYOU MUST RETURN STRICT JSON FORMAT AND INCLUDE <b>, <blockquote>, AND <a href=...> TAGS."
     try:
@@ -108,8 +145,10 @@ CRITICAL RULE FOR REDDIT SOURCES: Reddit posts are community discussions, not co
             ],
             response_format=GeneratedPost,
         )
+        parsed_post = response.choices[0].message.parsed
+        parsed_post.post_html = await _check_and_fix_grammar(parsed_post.post_html)
         await track_usage("generation", model, response.usage, news_item_id)
-        return response.choices[0].message.parsed
+        return parsed_post
     except Exception as e:
         logger.error(f"OpenAI generation error for item {news_item_id}: {e}")
         try:
@@ -121,8 +160,10 @@ CRITICAL RULE FOR REDDIT SOURCES: Reddit posts are community discussions, not co
                 ],
                 response_format=GeneratedPost,
             )
+            parsed_post = response.choices[0].message.parsed
+            parsed_post.post_html = await _check_and_fix_grammar(parsed_post.post_html)
             await track_usage("generation_retry", model, response.usage, news_item_id)
-            return response.choices[0].message.parsed
+            return parsed_post
         except Exception as retry_e:
             logger.error(f"OpenAI generation retry failed for item {news_item_id}: {retry_e}")
             return None

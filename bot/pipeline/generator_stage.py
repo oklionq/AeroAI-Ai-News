@@ -53,10 +53,10 @@ async def run_generator_stage(bot_instance, tracker=None):
             return "<b>" not in p.post_html or "<blockquote>" not in p.post_html or "<a href=" not in p.post_html or get_cyrillic_ratio(p.post_html) < 0.55 or has_hallucinated_year(p.post_html, pub_date_str)
 
         # Generate text
-        post = await generate_post_text(title, summary, source_name, item_id, url)
+        post = await generate_post_text(title, summary, source_name, item_id, url, category=category)
         if post and is_invalid(post):
             logger.warning(f"Formatting/Language failed for {item_id}, retrying...")
-            post = await generate_post_text(title, summary, source_name, item_id, url, retry_format=True)
+            post = await generate_post_text(title, summary, source_name, item_id, url, retry_format=True, category=category)
             if post and is_invalid(post):
                 logger.error(f"Formatting/Language retry failed for {item_id}")
                 post = None

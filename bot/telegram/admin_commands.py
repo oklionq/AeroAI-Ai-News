@@ -232,13 +232,8 @@ async def send_auto_published_to_group(bot: Bot, item_id: int, category: str, ur
     thread_id = config.topic_mapping.get(category, None)
     
     if thread_id is None:
-        err_msg = f"Не настроена тема для категории '{category}' в TOPIC_MAPPING (Авто-публикация)."
-        logger.error(err_msg)
-        try:
-            await bot.send_message(chat_id=config.admin_chat_id, text=f"❌ Ошибка авто-публикации: {err_msg}")
-        except:
-            pass
-        return
+        thread_id = config.default_topic_id
+        logger.info(f"Категория '{category}' не найдена в TOPIC_MAPPING. Используем DEFAULT_TOPIC_ID ({thread_id}) для авто-публикации.")
         
     if image_url and len(post_text) > 1024:
         image_url = None

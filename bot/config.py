@@ -7,6 +7,7 @@ class Settings(BaseModel):
     telegram_bot_token: str
     admin_chat_id: int
     target_group_id: int
+    default_topic_id: int
     topic_mapping: dict[str, int]
     
     openai_api_key: str
@@ -32,6 +33,7 @@ def load_config() -> Settings:
             telegram_bot_token=os.environ["TELEGRAM_BOT_TOKEN"],
             admin_chat_id=int(os.environ["ADMIN_CHAT_ID"]),
             target_group_id=int(os.environ["TARGET_GROUP_ID"]),
+            default_topic_id=int(os.getenv("DEFAULT_TOPIC_ID", "13")),
             topic_mapping=topic_mapping,
             openai_api_key=os.environ["OPENAI_API_KEY"],
             filter_model=os.getenv("FILTER_MODEL", "gpt-4o-mini"),
