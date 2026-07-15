@@ -230,6 +230,16 @@ async def on_undo_publish(callback: types.CallbackQuery, bot: Bot):
 
 async def send_auto_published_to_group(bot: Bot, item_id: int, category: str, url: str, post_text: str, image_url: str | None):
     thread_id = config.topic_mapping.get(category, None)
+    
+    if thread_id is None:
+        err_msg = f"Не настроена тема для категории '{category}' в TOPIC_MAPPING (Авто-публикация)."
+        logger.error(err_msg)
+        try:
+            await bot.send_message(chat_id=config.admin_chat_id, text=f"❌ Ошибка авто-публикации: {err_msg}")
+        except:
+            pass
+        return
+        
     if image_url and len(post_text) > 1024:
         image_url = None
         
