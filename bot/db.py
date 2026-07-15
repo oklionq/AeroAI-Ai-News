@@ -101,6 +101,7 @@ async def init_db():
                 sources_ok INTEGER DEFAULT 0,
                 sources_failed INTEGER DEFAULT 0,
                 items_raw INTEGER DEFAULT 0,
+                items_filtered_stale INTEGER DEFAULT 0,
                 items_after_dedup INTEGER DEFAULT 0,
                 items_passed_filter INTEGER DEFAULT 0,
                 items_sent_moderation INTEGER DEFAULT 0,
@@ -144,7 +145,8 @@ async def init_db():
             "ALTER TABLE news_items ADD COLUMN filter_confidence REAL",
             "ALTER TABLE news_items ADD COLUMN auto_published BOOLEAN DEFAULT 0",
             "ALTER TABLE news_items ADD COLUMN subject TEXT",
-            "ALTER TABLE sources ADD COLUMN disabled_at DATETIME"
+            "ALTER TABLE sources ADD COLUMN disabled_at DATETIME",
+            "ALTER TABLE poll_cycles ADD COLUMN items_filtered_stale INTEGER DEFAULT 0"
         ]:
             try:
                 await db.execute(col_query)

@@ -11,8 +11,8 @@ class CycleTracker:
     async def start_cycle(cls) -> "CycleTracker":
         async with get_db_connection() as db:
             cursor = await db.execute("""
-                INSERT INTO poll_cycles (started_at, status, errors_count, last_errors_json, sources_total, sources_ok, sources_failed, items_raw, items_after_dedup, items_passed_filter, items_sent_moderation, items_auto_published)
-                VALUES (?, 'running', 0, '[]', 0, 0, 0, 0, 0, 0, 0, 0)
+                INSERT INTO poll_cycles (started_at, status, errors_count, last_errors_json, sources_total, sources_ok, sources_failed, items_raw, items_filtered_stale, items_after_dedup, items_passed_filter, items_sent_moderation, items_auto_published)
+                VALUES (?, 'running', 0, '[]', 0, 0, 0, 0, 0, 0, 0, 0, 0)
             """, (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),))
             cycle_id = cursor.lastrowid
             await db.commit()
@@ -38,6 +38,9 @@ class CycleTracker:
 
     async def add_items_raw(self, count: int):
         await self._increment_counter("items_raw", count)
+
+    async def add_items_filtered_stale(self, count: int):
+        await self._increment_counter("items_filtered_stale", count)
 
     async def add_items_after_dedup(self, count: int):
         await self._increment_counter("items_after_dedup", count)

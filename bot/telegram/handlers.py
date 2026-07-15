@@ -133,7 +133,7 @@ async def cmd_cycle(message: types.Message):
             
         async with db.execute("""
             SELECT started_at, finished_at, duration_seconds, sources_total, sources_ok, sources_failed,
-                   items_raw, items_after_dedup, items_passed_filter, items_sent_moderation, items_auto_published,
+                   items_raw, items_filtered_stale, items_after_dedup, items_passed_filter, items_sent_moderation, items_auto_published,
                    errors_count, last_errors_json, status
             FROM poll_cycles
             ORDER BY id DESC LIMIT 1
@@ -170,7 +170,7 @@ async def cmd_cycle(message: types.Message):
         return
         
     (started_at, finished_at, duration, sources_total, sources_ok, sources_failed,
-     items_raw, items_after_dedup, items_passed_filter, items_sent_moderation, items_auto_published,
+     items_raw, items_filtered_stale, items_after_dedup, items_passed_filter, items_sent_moderation, items_auto_published,
      errors_count, last_errors_json, status) = cycle_row
      
     if status == 'running':
@@ -184,6 +184,8 @@ async def cmd_cycle(message: types.Message):
     text += f"Длительность: {duration} сек\n\n"
     text += f"Источники: {sources_ok}/{sources_total} успешно\n"
     text += f"Новых записей найдено: {items_raw}\n"
+    if items_filtered_stale is not None:
+        text += f"Отсеяно как устаревшие: {items_filtered_stale}\n"
     text += f"После проверки на дубли: {items_after_dedup}\n"
     text += f"Прошло фильтр важности: {items_passed_filter}\n"
     text += f"Отправлено на модерацию: {items_sent_moderation}\n"

@@ -70,11 +70,27 @@ async def save_new_items(items: list[dict], tracker=None):
         recent_titles_norm = [normalize_title(r[0]) for r in recent_records]
         
         new_count = 0
+        stale_count = 0
         for item in items:
             title = item["title"]
             url = item["url"]
             
             if not title or not url:
+                continue
+                
+            # Pre-filter by age (first)
+            is_stale = False
+            if not item.get("published_at"):
+                is_stale = True
+                logger.warning(f"Item without valid published_at filtered out: {url}")
+            else:
+                age_hours = (datetime.utcnow() - item["published_at"]).total_seconds() / 3600.0
+                if age_hours > config.max_news_age_hours:
+                    is_stale = True
+                    logger.info(f"Stale item {url} filtered out (age: {age_hours:.1f}h)")
+                    
+            if is_stale:
+                stale_count += 1
                 continue
                 
             title_norm = normalize_title(title)
@@ -94,23 +110,12 @@ async def save_new_items(items: list[dict], tracker=None):
                     
             if is_dup:
                 continue
-                
-            # Pre-filter by age
-            status = "collected"
-            if not item.get("published_at"):
-                status = "filtered_out_stale"
-                logger.warning(f"Item without valid published_at filtered out: {url}")
-            else:
-                age_hours = (datetime.utcnow() - item["published_at"]).total_seconds() / 3600.0
-                if age_hours > config.max_news_age_hours:
-                    status = "filtered_out_stale"
-                    logger.info(f"Stale item {url} filtered out (age: {age_hours:.1f}h)")
                     
             # Insert
             await db.execute("""
                 INSERT INTO news_items (source_id, url, url_hash, title_hash, title, summary, published_at, image_url, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (item["source_id"], url, url_hash, title_hash, title, item["summary"], item["published_at"], item.get("image_url"), status))
+            """, (item["source_id"], url, url_hash, title_hash, title, item["summary"], item["published_at"], item.get("image_url"), "collected"))
             
             recent_title_hashes.add(title_hash)
             recent_url_hashes.add(url_hash)
@@ -119,6 +124,7 @@ async def save_new_items(items: list[dict], tracker=None):
             
         await db.commit()
         if tracker:
+            await tracker.add_items_filtered_stale(stale_count)
             await tracker.add_items_after_dedup(new_count)
             
         logger.info(f"Collector finished. Inserted {new_count} new items.")
