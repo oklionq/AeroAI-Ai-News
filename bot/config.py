@@ -20,6 +20,7 @@ class Settings(BaseModel):
     max_news_age_hours: int = 72
     topic_dedup_days: int = 14
     display_timezone: str = "Europe/Riga"
+    min_image_width: int = 400
 
 def load_config() -> Settings:
     from dotenv import load_dotenv
@@ -43,7 +44,8 @@ def load_config() -> Settings:
             database_url=os.getenv("DATABASE_URL", ""),
             max_news_age_hours=int(os.getenv("MAX_NEWS_AGE_HOURS", "72")),
             topic_dedup_days=int(os.getenv("TOPIC_DEDUP_DAYS", "14")),
-            display_timezone=os.getenv("DISPLAY_TIMEZONE", "Europe/Riga")
+            display_timezone=os.getenv("DISPLAY_TIMEZONE", "Europe/Riga"),
+            min_image_width=int(os.getenv("MIN_IMAGE_WIDTH", "400"))
         )
         return settings
     except KeyError as e:

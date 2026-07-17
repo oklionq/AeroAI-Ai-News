@@ -1,7 +1,9 @@
 import asyncio
+import json
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramRetryAfter
+from aiogram.types import InputMediaPhoto
 from bot.config import config
 from bot.telegram.keyboards import get_main_keyboard, get_review_keyboard
 from bot.telegram.formatting import safe_format
@@ -11,39 +13,125 @@ from bot.utils.logger import logger
 
 dp = Dispatcher()
 
-async def send_draft_to_admin(bot: Bot, item_id: int, post_text: str, image_url: str | None):
-    if image_url and len(post_text) > 1024:
-        image_url = None
-        
+
+# ---------------------------------------------------------------------------
+# Sending draft to admin (supports 0, 1, or 2+ photos)
+# ---------------------------------------------------------------------------
+
+async def send_draft_to_admin(bot: Bot, item_id: int, post_text: str, image_urls: list[str] | None):
+    """
+    Send a news draft to admin for review.
+    - 0 images: text message with inline buttons
+    - 1 image: sendPhoto with caption + inline buttons
+    - 2+ images: sendMediaGroup (album, no buttons) + separate text message with inline buttons
+    """
+    if image_urls is None:
+        image_urls = []
+
     markup = get_review_keyboard(item_id)
-    text = safe_format(post_text, max_len=1024 if image_url else 4096)
-    
+
     try:
-        if image_url:
-            await bot.send_photo(
+        if len(image_urls) >= 2:
+            # --- Album mode ---
+            media = [InputMediaPhoto(media=url) for url in image_urls[:4]]
+            album_messages = await bot.send_media_group(
                 chat_id=config.admin_chat_id,
-                photo=image_url,
-                caption=text,
-                parse_mode="HTML",
-                reply_markup=markup
+                media=media
             )
-        else:
-            await bot.send_message(
+
+            # Save file_ids from Telegram's response (largest size = last in .photo list)
+            file_ids = []
+            album_msg_ids = []
+            for msg in album_messages:
+                album_msg_ids.append(msg.message_id)
+                if msg.photo:
+                    file_ids.append(msg.photo[-1].file_id)
+
+            # Send control message with full text + buttons
+            text = safe_format(post_text, max_len=4096)
+            control_msg = await bot.send_message(
                 chat_id=config.admin_chat_id,
                 text=text,
                 parse_mode="HTML",
                 reply_markup=markup,
                 disable_web_page_preview=True
             )
+
+            # Persist file_ids, album message IDs, and control message ID
+            async with get_db_connection() as db:
+                await db.execute("""
+                    UPDATE news_items 
+                    SET image_file_ids = ?, telegram_album_message_ids = ?, telegram_control_message_id = ?
+                    WHERE id = ?
+                """, (json.dumps(file_ids), json.dumps(album_msg_ids), control_msg.message_id, item_id))
+                await db.commit()
+
+        elif len(image_urls) == 1:
+            # --- Single photo mode ---
+            text = safe_format(post_text, max_len=1024)
+            if len(post_text) > 1024:
+                # Caption too long for photo — send as text instead
+                control_msg = await bot.send_message(
+                    chat_id=config.admin_chat_id,
+                    text=safe_format(post_text, max_len=4096),
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                    disable_web_page_preview=True
+                )
+                async with get_db_connection() as db:
+                    await db.execute(
+                        "UPDATE news_items SET telegram_control_message_id = ? WHERE id = ?",
+                        (control_msg.message_id, item_id)
+                    )
+                    await db.commit()
+            else:
+                msg = await bot.send_photo(
+                    chat_id=config.admin_chat_id,
+                    photo=image_urls[0],
+                    caption=text,
+                    parse_mode="HTML",
+                    reply_markup=markup
+                )
+                # Save file_id for reuse during publishing
+                file_ids = [msg.photo[-1].file_id] if msg.photo else []
+                async with get_db_connection() as db:
+                    await db.execute("""
+                        UPDATE news_items 
+                        SET image_file_ids = ?, telegram_control_message_id = ?
+                        WHERE id = ?
+                    """, (json.dumps(file_ids), msg.message_id, item_id))
+                    await db.commit()
+        else:
+            # --- No image mode ---
+            text = safe_format(post_text, max_len=4096)
+            control_msg = await bot.send_message(
+                chat_id=config.admin_chat_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=markup,
+                disable_web_page_preview=True
+            )
+            async with get_db_connection() as db:
+                await db.execute(
+                    "UPDATE news_items SET telegram_control_message_id = ? WHERE id = ?",
+                    (control_msg.message_id, item_id)
+                )
+                await db.commit()
+
     except TelegramRetryAfter as e:
         logger.warning(f"Rate limited by Telegram. Retrying after {e.retry_after} seconds.")
         await asyncio.sleep(e.retry_after)
-        await send_draft_to_admin(bot, item_id, post_text, image_url)
+        await send_draft_to_admin(bot, item_id, post_text, image_urls)
     except Exception as e:
         logger.error(f"Failed to send draft for item {item_id}: {e}")
-        # fallback to text if photo failed
-        if image_url:
-            await send_draft_to_admin(bot, item_id, post_text, None)
+        # fallback: retry without images
+        if image_urls:
+            await send_draft_to_admin(bot, item_id, post_text, [])
+
+
+# ---------------------------------------------------------------------------
+# Bot commands
+# ---------------------------------------------------------------------------
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -193,7 +281,6 @@ async def cmd_cycle(message: types.Message):
     text += f"Ошибок за цикл: {errors_count}"
     
     if errors_count > 0 and last_errors_json:
-        import json
         try:
             errs = json.loads(last_errors_json)
             if errs:
@@ -242,6 +329,11 @@ async def cmd_pause_resume(message: types.Message):
     else:
         await message.answer("▶️ Работа бота возобновлена.")
 
+
+# ---------------------------------------------------------------------------
+# Review callbacks (approve / reject) — supports album + control message
+# ---------------------------------------------------------------------------
+
 @dp.callback_query(F.data.startswith("act:"))
 async def on_review_action(callback: types.CallbackQuery, bot: Bot):
     if callback.from_user.id != config.admin_chat_id:
@@ -252,18 +344,32 @@ async def on_review_action(callback: types.CallbackQuery, bot: Bot):
     item_id = int(item_id_str)
     
     async with get_db_connection() as db:
-        async with db.execute("SELECT status, post_text_json, image_url, filter_category, url FROM news_items WHERE id = ?", (item_id,)) as cur:
+        async with db.execute("""
+            SELECT status, post_text_json, image_urls, image_file_ids, filter_category, url
+            FROM news_items WHERE id = ?
+        """, (item_id,)) as cur:
             row = await cur.fetchone()
             
     if not row:
         await callback.answer("Item not found", show_alert=True)
         return
         
-    status, post_text, image_url, category, url = row
+    status, post_text, image_urls_json, image_file_ids_json, category, url = row
     
     if status != 'pending_review':
         await callback.answer("Уже обработано", show_alert=True)
         return
+
+    # Parse JSON fields
+    try:
+        image_urls = json.loads(image_urls_json) if image_urls_json else []
+    except (json.JSONDecodeError, TypeError):
+        image_urls = []
+
+    try:
+        image_file_ids = json.loads(image_file_ids_json) if image_file_ids_json else []
+    except (json.JSONDecodeError, TypeError):
+        image_file_ids = []
         
     if action == "reject":
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -288,21 +394,83 @@ async def on_review_action(callback: types.CallbackQuery, bot: Bot):
             thread_id = config.default_topic_id
             logger.info(f"Категория '{category}' не найдена в TOPIC_MAPPING. Используем DEFAULT_TOPIC_ID ({thread_id}).")
         
-        if image_url and len(post_text) > 1024:
-            image_url = None
-            
-        text = safe_format(post_text, max_len=1024 if image_url else 4096)
-        
         try:
-            if image_url:
-                await bot.send_photo(
+            if len(image_file_ids) >= 2:
+                # --- Publish album using saved file_ids ---
+                media = [InputMediaPhoto(media=fid) for fid in image_file_ids[:4]]
+                await bot.send_media_group(
                     chat_id=config.target_group_id,
                     message_thread_id=thread_id,
-                    photo=image_url,
-                    caption=text,
-                    parse_mode="HTML"
+                    media=media
                 )
+                # Send text as separate message
+                text = safe_format(post_text, max_len=4096)
+                await bot.send_message(
+                    chat_id=config.target_group_id,
+                    message_thread_id=thread_id,
+                    text=text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+
+            elif len(image_file_ids) == 1:
+                text = safe_format(post_text, max_len=1024)
+                if len(post_text) > 1024:
+                    # Caption too long — send text only
+                    await bot.send_message(
+                        chat_id=config.target_group_id,
+                        message_thread_id=thread_id,
+                        text=safe_format(post_text, max_len=4096),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
+                else:
+                    await bot.send_photo(
+                        chat_id=config.target_group_id,
+                        message_thread_id=thread_id,
+                        photo=image_file_ids[0],
+                        caption=text,
+                        parse_mode="HTML"
+                    )
+
+            elif len(image_urls) >= 2:
+                # Fallback: no file_ids saved, use original URLs
+                media = [InputMediaPhoto(media=u) for u in image_urls[:4]]
+                await bot.send_media_group(
+                    chat_id=config.target_group_id,
+                    message_thread_id=thread_id,
+                    media=media
+                )
+                text = safe_format(post_text, max_len=4096)
+                await bot.send_message(
+                    chat_id=config.target_group_id,
+                    message_thread_id=thread_id,
+                    text=text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+
+            elif len(image_urls) == 1:
+                text = safe_format(post_text, max_len=1024)
+                if len(post_text) > 1024:
+                    await bot.send_message(
+                        chat_id=config.target_group_id,
+                        message_thread_id=thread_id,
+                        text=safe_format(post_text, max_len=4096),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
+                else:
+                    await bot.send_photo(
+                        chat_id=config.target_group_id,
+                        message_thread_id=thread_id,
+                        photo=image_urls[0],
+                        caption=text,
+                        parse_mode="HTML"
+                    )
             else:
+                # No images
+                text = safe_format(post_text, max_len=4096)
                 await bot.send_message(
                     chat_id=config.target_group_id,
                     message_thread_id=thread_id,
@@ -319,6 +487,7 @@ async def on_review_action(callback: types.CallbackQuery, bot: Bot):
                 """, (item_id,))
                 await db.commit()
                 
+            # Update control message to show "Published" status
             if callback.message.caption:
                 await callback.message.edit_caption(caption=callback.message.caption + "\n\n✅ Опубликовано")
             else:

@@ -16,7 +16,8 @@ async def fetch_hackernews(source_id: int, source_name: str, url: str) -> list[d
                 "summary": hit.get("story_text", "") or "No text provided.",
                 "url": url_link,
                 "published_at": datetime.utcfromtimestamp(hit.get("created_at_i", 0)),
-                "source_id": source_id
+                "source_id": source_id,
+                "image_urls": "[]"
             })
             
         await reset_source_fails(source_id)

@@ -26,9 +26,12 @@ class NewsItem(BaseModel):
     filter_category: Optional[str] = None
     subject: Optional[str] = None
     filter_reason: Optional[str] = None
-    image_url: Optional[str] = None
+    image_urls: list[str] = []
+    image_file_ids: list[str] = []
     post_text_json: Optional[str] = None
     telegram_message_id: Optional[int] = None
+    telegram_album_message_ids: list[int] = []
+    telegram_control_message_id: Optional[int] = None
     thread_id: Optional[int] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None

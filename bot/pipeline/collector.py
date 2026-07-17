@@ -113,9 +113,9 @@ async def save_new_items(items: list[dict], tracker=None):
                     
             # Insert
             await db.execute("""
-                INSERT INTO news_items (source_id, url, url_hash, title_hash, title, summary, published_at, image_url, status)
+                INSERT INTO news_items (source_id, url, url_hash, title_hash, title, summary, published_at, image_urls, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (item["source_id"], url, url_hash, title_hash, title, item["summary"], item["published_at"], item.get("image_url"), "collected"))
+            """, (item["source_id"], url, url_hash, title_hash, title, item["summary"], item["published_at"], item.get("image_urls", "[]"), "collected"))
             
             recent_title_hashes.add(title_hash)
             recent_url_hashes.add(url_hash)

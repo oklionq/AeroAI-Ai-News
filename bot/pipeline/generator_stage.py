@@ -1,16 +1,21 @@
+import json
+import re
+import datetime
+
 from bot.db import get_db_connection
 from bot.services.openai_client import generate_post_text
 from bot.services.budget_guard import check_budget
-from bot.pipeline.images import fetch_og_image, fetch_reddit_image
+from bot.pipeline.images import fetch_reddit_images, fetch_og_images
 from bot.utils.logger import logger
-import datetime
+
+
 async def run_generator_stage(bot_instance, tracker=None):
     if not await check_budget():
         return
         
     async with get_db_connection() as db:
         async with db.execute("""
-            SELECT n.id, n.title, n.summary, s.name, n.filter_category, n.url, n.image_url, s.type, n.published_at, n.subject
+            SELECT n.id, n.title, n.summary, s.name, n.filter_category, n.url, n.image_urls, s.type, n.published_at, n.subject
             FROM news_items n
             JOIN sources s ON n.source_id = s.id
             WHERE n.status = 'pending_generation'
@@ -18,7 +23,7 @@ async def run_generator_stage(bot_instance, tracker=None):
         """) as cursor:
             items = await cursor.fetchall()
             
-    for item_id, title, summary, source_name, category, url, existing_image_url, source_type, pub_date_str, subject in items:
+    for item_id, title, summary, source_name, category, url, existing_image_urls_json, source_type, pub_date_str, subject in items:
         if not await check_budget():
             break
             
@@ -27,7 +32,6 @@ async def run_generator_stage(bot_instance, tracker=None):
             await db.execute("UPDATE news_items SET status = 'processing_generation' WHERE id = ?", (item_id,))
             await db.commit()
             
-        import re
         def get_cyrillic_ratio(text):
             text_no_html = re.sub(r'<[^>]+>', '', text)
             cyr_chars = len(re.findall(r'[а-яА-ЯёЁ]', text_no_html))
@@ -72,21 +76,37 @@ async def run_generator_stage(bot_instance, tracker=None):
                 await tracker.add_error(f"Generator LLM error for item {item_id}")
             continue
             
-        status = 'pending_review'
-        # Fetch image
-        image_url = None
+        # --- Collect images (multi-photo support, up to 4) ---
+        image_urls: list[str] = []
+
+        # Parse existing image URLs from collector stage
+        try:
+            existing_urls = json.loads(existing_image_urls_json) if existing_image_urls_json else []
+        except (json.JSONDecodeError, TypeError):
+            existing_urls = []
+
         if source_type == 'reddit':
-            image_url = await fetch_reddit_image(summary, url)
-            
-        if not image_url:
-            image_url = existing_image_url
-            
-        if not image_url:
-            image_url = await fetch_og_image(url)
-        
-        if not image_url:
+            reddit_images = await fetch_reddit_images(summary, url)
+            image_urls.extend(reddit_images)
+
+        # Add collector-stage images that aren't already in the list
+        for eu in existing_urls:
+            if eu and eu not in image_urls and len(image_urls) < 4:
+                image_urls.append(eu)
+
+        # Try OG images if we still don't have enough
+        if len(image_urls) < 4:
+            og_images = await fetch_og_images(url)
+            for og in og_images:
+                if og not in image_urls and len(image_urls) < 4:
+                    image_urls.append(og)
+
+        status = 'pending_review'
+        if not image_urls:
             if category != 'model_release':
                 status = 'skipped_no_image'
+                
+        image_urls_json = json.dumps(image_urls)
                 
         auto_published = False
         if status == 'pending_review':
@@ -102,24 +122,24 @@ async def run_generator_stage(bot_instance, tracker=None):
             if auto_published:
                 await db.execute("""
                     UPDATE news_items 
-                    SET status = ?, post_text_json = ?, image_url = ?, updated_at = CURRENT_TIMESTAMP, auto_published = 1, decision_at = CURRENT_TIMESTAMP
+                    SET status = ?, post_text_json = ?, image_urls = ?, updated_at = CURRENT_TIMESTAMP, auto_published = 1, decision_at = CURRENT_TIMESTAMP
                     WHERE id = ?
-                """, (status, post.post_html, image_url, item_id))
+                """, (status, post.post_html, image_urls_json, item_id))
             else:
                 await db.execute("""
                     UPDATE news_items 
-                    SET status = ?, post_text_json = ?, image_url = ?, updated_at = CURRENT_TIMESTAMP
+                    SET status = ?, post_text_json = ?, image_urls = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
-                """, (status, post.post_html, image_url, item_id))
+                """, (status, post.post_html, image_urls_json, item_id))
             await db.commit()
             
         if auto_published:
             from bot.telegram.admin_commands import send_auto_published_to_group
-            await send_auto_published_to_group(bot_instance, item_id, category, url, post.post_html, image_url)
+            await send_auto_published_to_group(bot_instance, item_id, category, url, post.post_html, image_urls)
             if tracker:
                 await tracker.add_items_auto_published(1)
         elif status == 'pending_review':
             from bot.telegram.handlers import send_draft_to_admin
-            await send_draft_to_admin(bot_instance, item_id, post.post_html, image_url)
+            await send_draft_to_admin(bot_instance, item_id, post.post_html, image_urls)
             if tracker:
                 await tracker.add_items_sent_moderation(1)

@@ -43,9 +43,12 @@ async def init_db():
                 filter_category TEXT,
                 subject TEXT,
                 filter_reason TEXT,
-                image_url TEXT,
+                image_urls TEXT DEFAULT '[]',
+                image_file_ids TEXT DEFAULT '[]',
                 post_text_json TEXT,
                 telegram_message_id INTEGER,
+                telegram_album_message_ids TEXT DEFAULT '[]',
+                telegram_control_message_id INTEGER,
                 thread_id INTEGER,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -146,7 +149,11 @@ async def init_db():
             "ALTER TABLE news_items ADD COLUMN auto_published BOOLEAN DEFAULT 0",
             "ALTER TABLE news_items ADD COLUMN subject TEXT",
             "ALTER TABLE sources ADD COLUMN disabled_at DATETIME",
-            "ALTER TABLE poll_cycles ADD COLUMN items_filtered_stale INTEGER DEFAULT 0"
+            "ALTER TABLE poll_cycles ADD COLUMN items_filtered_stale INTEGER DEFAULT 0",
+            "ALTER TABLE news_items ADD COLUMN image_urls TEXT DEFAULT '[]'",
+            "ALTER TABLE news_items ADD COLUMN image_file_ids TEXT DEFAULT '[]'",
+            "ALTER TABLE news_items ADD COLUMN telegram_album_message_ids TEXT DEFAULT '[]'",
+            "ALTER TABLE news_items ADD COLUMN telegram_control_message_id INTEGER",
         ]:
             try:
                 await db.execute(col_query)
@@ -155,6 +162,17 @@ async def init_db():
             
         try:
             await db.execute("ALTER TABLE bot_state ADD COLUMN auto_publish_categories TEXT DEFAULT ''")
+        except Exception:
+            pass
+        
+        # Migrate legacy image_url -> image_urls (one-time, for existing rows)
+        try:
+            await db.execute("""
+                UPDATE news_items 
+                SET image_urls = json_array(image_url) 
+                WHERE image_url IS NOT NULL AND image_url != '' 
+                AND (image_urls IS NULL OR image_urls = '[]')
+            """)
         except Exception:
             pass
 

@@ -1,3 +1,4 @@
+import json
 import feedparser
 from datetime import datetime
 import time
@@ -21,13 +22,17 @@ async def fetch_rss(source_id: int, source_name: str, url: str) -> list[dict]:
             else:
                 published_at = None
                 
-            image_url = None
+            image_urls = []
             if getattr(entry, 'media_content', None) and len(entry.media_content) > 0:
-                image_url = entry.media_content[0].get('url')
+                mc_url = entry.media_content[0].get('url')
+                if mc_url:
+                    image_urls.append(mc_url)
             elif getattr(entry, 'links', None):
                 for link in entry.links:
                     if link.get('rel') == 'enclosure' and 'image' in link.get('type', ''):
-                        image_url = link.get('href')
+                        enc_url = link.get('href')
+                        if enc_url:
+                            image_urls.append(enc_url)
                         break
                 
             items.append({
@@ -36,7 +41,7 @@ async def fetch_rss(source_id: int, source_name: str, url: str) -> list[dict]:
                 "url": entry.get("link", ""),
                 "published_at": published_at,
                 "source_id": source_id,
-                "image_url": image_url
+                "image_urls": json.dumps(image_urls)
             })
             
         await reset_source_fails(source_id)

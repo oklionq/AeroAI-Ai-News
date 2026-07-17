@@ -1,9 +1,9 @@
 import json
 import os
-import aiosqlite
+import re
 from aiogram import Bot, types, F
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, InputMediaPhoto
 from bot.config import config
 from bot.db import get_db_connection
 from bot.telegram.handlers import dp
@@ -209,17 +209,35 @@ async def on_undo_publish(callback: types.CallbackQuery, bot: Bot):
     item_id = int(item_id_str)
     
     async with get_db_connection() as db:
-        async with db.execute("SELECT telegram_message_id FROM news_items WHERE id = ?", (item_id,)) as cur:
+        async with db.execute("""
+            SELECT telegram_message_id, telegram_album_message_ids 
+            FROM news_items WHERE id = ?
+        """, (item_id,)) as cur:
             row = await cur.fetchone()
             
-    if not row or not row[0]:
+    if not row:
         await callback.answer("Message ID not found", show_alert=True)
         return
-        
+    
+    msg_id, album_ids_json = row
+    
+    # Try to delete published messages
+    if msg_id:
+        try:
+            await bot.delete_message(chat_id=config.target_group_id, message_id=msg_id)
+        except Exception as e:
+            logger.warning(f"Could not delete message {msg_id}: {e}")
+    
+    # Also delete album messages if any
     try:
-        await bot.delete_message(chat_id=config.target_group_id, message_id=row[0])
-    except Exception as e:
-        logger.warning(f"Could not delete message: {e}")
+        album_ids = json.loads(album_ids_json) if album_ids_json else []
+        for amid in album_ids:
+            try:
+                await bot.delete_message(chat_id=config.target_group_id, message_id=amid)
+            except Exception as e:
+                logger.warning(f"Could not delete album message {amid}: {e}")
+    except (json.JSONDecodeError, TypeError):
+        pass
         
     async with get_db_connection() as db:
         await db.execute("UPDATE news_items SET status = 'retracted', decision_at = CURRENT_TIMESTAMP WHERE id = ?", (item_id,))
@@ -228,28 +246,71 @@ async def on_undo_publish(callback: types.CallbackQuery, bot: Bot):
     await callback.message.edit_text(callback.message.text + "\n\n↩️ Отменено")
     await callback.answer("Отменено")
 
-async def send_auto_published_to_group(bot: Bot, item_id: int, category: str, url: str, post_text: str, image_url: str | None):
+async def send_auto_published_to_group(bot: Bot, item_id: int, category: str, url: str, post_text: str, image_urls: list[str]):
+    """Auto-publish a post to the target group. Supports multi-photo albums."""
     thread_id = config.topic_mapping.get(category, None)
     
     if thread_id is None:
         thread_id = config.default_topic_id
         logger.info(f"Категория '{category}' не найдена в TOPIC_MAPPING. Используем DEFAULT_TOPIC_ID ({thread_id}) для авто-публикации.")
-        
-    if image_url and len(post_text) > 1024:
-        image_url = None
-        
-    text = safe_format(post_text, max_len=1024 if image_url else 4096)
     
     try:
-        if image_url:
-            msg = await bot.send_photo(
+        published_msg_id = None
+
+        if len(image_urls) >= 2:
+            # Album mode
+            media = [InputMediaPhoto(media=u) for u in image_urls[:4]]
+            album_msgs = await bot.send_media_group(
                 chat_id=config.target_group_id,
                 message_thread_id=thread_id,
-                photo=image_url,
-                caption=text,
-                parse_mode="HTML"
+                media=media
             )
+            text = safe_format(post_text, max_len=4096)
+            text_msg = await bot.send_message(
+                chat_id=config.target_group_id,
+                message_thread_id=thread_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            published_msg_id = text_msg.message_id
+            
+            # Store album message IDs for undo
+            album_ids = [m.message_id for m in album_msgs]
+            async with get_db_connection() as db:
+                await db.execute("""
+                    UPDATE news_items 
+                    SET telegram_message_id = ?, telegram_album_message_ids = ?
+                    WHERE id = ?
+                """, (published_msg_id, json.dumps(album_ids), item_id))
+                await db.commit()
+
+        elif len(image_urls) == 1:
+            if len(post_text) > 1024:
+                msg = await bot.send_message(
+                    chat_id=config.target_group_id,
+                    message_thread_id=thread_id,
+                    text=safe_format(post_text, max_len=4096),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+            else:
+                text = safe_format(post_text, max_len=1024)
+                msg = await bot.send_photo(
+                    chat_id=config.target_group_id,
+                    message_thread_id=thread_id,
+                    photo=image_urls[0],
+                    caption=text,
+                    parse_mode="HTML"
+                )
+            published_msg_id = msg.message_id
+            
+            async with get_db_connection() as db:
+                await db.execute("UPDATE news_items SET telegram_message_id = ? WHERE id = ?", (published_msg_id, item_id))
+                await db.commit()
+
         else:
+            text = safe_format(post_text, max_len=4096)
             msg = await bot.send_message(
                 chat_id=config.target_group_id,
                 message_thread_id=thread_id,
@@ -257,15 +318,16 @@ async def send_auto_published_to_group(bot: Bot, item_id: int, category: str, ur
                 parse_mode="HTML",
                 disable_web_page_preview=True
             )
+            published_msg_id = msg.message_id
             
-        async with get_db_connection() as db:
-            await db.execute("UPDATE news_items SET telegram_message_id = ? WHERE id = ?", (msg.message_id, item_id))
-            await db.commit()
+            async with get_db_connection() as db:
+                await db.execute("UPDATE news_items SET telegram_message_id = ? WHERE id = ?", (published_msg_id, item_id))
+                await db.commit()
             
+        # Notify admin with undo button
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-        import re
         title = "Новость"
-        match = re.search(r'<b>(.*?)</b>', text)
+        match = re.search(r'<b>(.*?)</b>', post_text)
         if match:
             title = match.group(1)
             
@@ -309,5 +371,4 @@ async def cmd_testpost(message: types.Message, bot: Bot):
         item_id = cursor.lastrowid
         await db.commit()
         
-    await send_draft_to_admin(bot, item_id, test_post_text, None)
-
+    await send_draft_to_admin(bot, item_id, test_post_text, [])
