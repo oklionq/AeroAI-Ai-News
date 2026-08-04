@@ -15,7 +15,7 @@ class Settings(BaseModel):
     generation_model: str = "gpt-4o-mini"
     max_budget_usd: float = 5.0
     
-    poll_interval_minutes: int = 15
+    poll_interval_minutes: int = 60
     database_url: str = ""
     max_news_age_hours: int = 72
     topic_dedup_days: int = 14
@@ -40,7 +40,7 @@ def load_config() -> Settings:
             filter_model=os.getenv("FILTER_MODEL", "gpt-4o-mini"),
             generation_model=os.getenv("GENERATION_MODEL", "gpt-4o-mini"),
             max_budget_usd=float(os.getenv("MAX_BUDGET_USD", "5.0")),
-            poll_interval_minutes=int(os.getenv("POLL_INTERVAL_MINUTES", "15")),
+            poll_interval_minutes=int(os.getenv("POLL_INTERVAL_MINUTES", "60")),
             database_url=os.getenv("DATABASE_URL", ""),
             max_news_age_hours=int(os.getenv("MAX_NEWS_AGE_HOURS", "72")),
             topic_dedup_days=int(os.getenv("TOPIC_DEDUP_DAYS", "14")),
