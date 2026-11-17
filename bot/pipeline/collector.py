@@ -1,12 +1,11 @@
+import asyncio
+import json
+from datetime import datetime, timezone
 from bot.db import get_db_connection
 from bot.utils.dedup import normalize_title, generate_hash, get_url_hash, title_similarity
-from bot.sources.rss_sources import fetch_rss
-from bot.sources.reddit import fetch_reddit
-from bot.sources.hackernews import fetch_hackernews
+from bot.sources.telegram_channel import fetch_telegram_channel
 from bot.utils.logger import logger
 from bot.config import config
-import asyncio
-from datetime import datetime
 
 async def run_collector(tracker=None):
     logger.info("Starting collector cycle.")
@@ -23,6 +22,16 @@ async def run_collector(tracker=None):
         async with db.execute("SELECT id, name, type, url FROM sources WHERE enabled = 1") as cursor:
             sources = await cursor.fetchall()
             
+    if not sources:
+        # Ensure default source exists if table is empty
+        async with get_db_connection() as db:
+            await db.execute("""
+                INSERT OR IGNORE INTO sources (id, name, type, url, enabled)
+                VALUES (1, 'ThePerceptronChannel', 'telegram_channel', 'https://t.me/ThePerceptronChannel', 1)
+            """)
+            await db.commit()
+            sources = [(1, 'ThePerceptronChannel', 'telegram_channel', 'https://t.me/ThePerceptronChannel')]
+
     if tracker:
         await tracker.set_sources_total(len(sources))
             
@@ -30,21 +39,17 @@ async def run_collector(tracker=None):
     
     for s_id, s_name, s_type, s_url in sources:
         try:
-            if s_type == "rss":
-                items = await fetch_rss(s_id, s_name, s_url)
-            elif s_type == "reddit":
-                items = await fetch_reddit(s_id, s_name, s_url)
-            elif s_type == "hackernews":
-                items = await fetch_hackernews(s_id, s_name, s_url)
+            if s_type == "telegram_channel":
+                items = await fetch_telegram_channel(s_id, s_name)
             else:
-                logger.warning(f"Unknown source type {s_type} for {s_name}")
-                continue
+                logger.warning(f"Unknown or deprecated source type {s_type} for {s_name}. Using Telegram parser.")
+                items = await fetch_telegram_channel(s_id, s_name)
                 
             all_items.extend(items)
             if tracker:
                 await tracker.add_source_ok()
         except Exception as e:
-            logger.error(f"Collector error for {s_name}: {e}")
+            logger.error(f"Collector error for {s_name}: {e}", exc_info=True)
             if tracker:
                 await tracker.add_source_failed()
                 await tracker.add_error(f"Source {s_name} ({s_type}): {e}")
@@ -57,37 +62,45 @@ async def run_collector(tracker=None):
 async def save_new_items(items: list[dict], tracker=None):
     async with get_db_connection() as db:
         # Load recent items for deduplication
-        recent_records = []
         async with db.execute("""
-            SELECT title, title_hash, url_hash 
+            SELECT title, title_hash, url_hash, telegram_source_msg_id 
             FROM news_items 
             WHERE created_at >= datetime('now', '-14 day')
         """) as cursor:
             recent_records = await cursor.fetchall()
             
-        recent_url_hashes = {r[2] for r in recent_records}
-        recent_title_hashes = {r[1] for r in recent_records}
-        recent_titles_norm = [normalize_title(r[0]) for r in recent_records]
+        recent_url_hashes = {r[2] for r in recent_records if r[2]}
+        recent_title_hashes = {r[1] for r in recent_records if r[1]}
+        recent_msg_ids = {r[3] for r in recent_records if r[3] is not None}
+        recent_titles_norm = [normalize_title(r[0]) for r in recent_records if r[0]]
         
         new_count = 0
         stale_count = 0
+        now_utc = datetime.now(timezone.utc)
+
         for item in items:
             title = item["title"]
             url = item["url"]
+            source_msg_id = item.get("source_msg_id")
             
             if not title or not url:
                 continue
+
+            # Exact message ID match from donor channel
+            if source_msg_id and source_msg_id in recent_msg_ids:
+                continue
                 
-            # Pre-filter by age (first)
+            # Pre-filter by age
             is_stale = False
-            if not item.get("published_at"):
+            pub_at = item.get("published_at")
+            if not pub_at:
                 is_stale = True
-                logger.warning(f"Item without valid published_at filtered out: {url}")
             else:
-                age_hours = (datetime.utcnow() - item["published_at"]).total_seconds() / 3600.0
+                if pub_at.tzinfo is None:
+                    pub_at = pub_at.replace(tzinfo=timezone.utc)
+                age_hours = (now_utc - pub_at).total_seconds() / 3600.0
                 if age_hours > config.max_news_age_hours:
                     is_stale = True
-                    logger.info(f"Stale item {url} filtered out (age: {age_hours:.1f}h)")
                     
             if is_stale:
                 stale_count += 1
@@ -104,21 +117,31 @@ async def save_new_items(items: list[dict], tracker=None):
             # Fuzzy title match
             is_dup = False
             for r_title_norm in recent_titles_norm:
-                if title_similarity(title_norm, r_title_norm) > 0.7:
+                if title_similarity(title_norm, r_title_norm) > 0.8:
                     is_dup = True
                     break
                     
             if is_dup:
                 continue
                     
-            # Insert
+            # Insert new item
+            pub_str = pub_at.strftime("%Y-%m-%d %H:%M:%S") if pub_at else None
             await db.execute("""
-                INSERT INTO news_items (source_id, url, url_hash, title_hash, title, summary, published_at, image_urls, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (item["source_id"], url, url_hash, title_hash, title, item["summary"], item["published_at"], item.get("image_urls", "[]"), "collected"))
+                INSERT INTO news_items (
+                    source_id, url, url_hash, title_hash, title, summary, 
+                    published_at, image_urls, status, telegram_source_msg_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                item["source_id"], url, url_hash, title_hash, title, 
+                item["summary"], pub_str, item.get("image_urls", "[]"), 
+                "collected", source_msg_id
+            ))
             
             recent_title_hashes.add(title_hash)
             recent_url_hashes.add(url_hash)
+            if source_msg_id:
+                recent_msg_ids.add(source_msg_id)
             recent_titles_norm.append(title_norm)
             new_count += 1
             
@@ -127,4 +150,4 @@ async def save_new_items(items: list[dict], tracker=None):
             await tracker.add_items_filtered_stale(stale_count)
             await tracker.add_items_after_dedup(new_count)
             
-        logger.info(f"Collector finished. Inserted {new_count} new items.")
+        logger.info(f"Collector finished. Inserted {new_count} new items (stale filtered: {stale_count}).")

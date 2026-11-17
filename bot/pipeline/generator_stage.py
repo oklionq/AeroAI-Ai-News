@@ -2,15 +2,16 @@ import json
 import re
 import datetime
 
+from bot.config import config
 from bot.db import get_db_connection
 from bot.services.openai_client import generate_post_text
 from bot.services.budget_guard import check_budget
-from bot.pipeline.images import fetch_reddit_images, fetch_og_images
+from bot.pipeline.images import filter_valid_local_images
 from bot.utils.logger import logger
-
 
 async def run_generator_stage(bot_instance, tracker=None):
     if not await check_budget():
+        logger.info("Budget limit reached. Skipping generator stage.")
         return
         
     async with get_db_connection() as db:
@@ -54,7 +55,13 @@ async def run_generator_stage(bot_instance, tracker=None):
             return False
 
         def is_invalid(p):
-            return "<b>" not in p.post_html or "<blockquote>" not in p.post_html or "<a href=" not in p.post_html or get_cyrillic_ratio(p.post_html) < 0.55 or has_hallucinated_year(p.post_html, pub_date_str)
+            return (
+                "<b>" not in p.post_html or 
+                "<blockquote>" not in p.post_html or 
+                get_cyrillic_ratio(p.post_html) < 0.55 or 
+                has_hallucinated_year(p.post_html, pub_date_str) or 
+                len(p.post_html) > 950
+            )
 
         # Generate text
         post = await generate_post_text(title, summary, source_name, item_id, url, category=category)
@@ -76,40 +83,18 @@ async def run_generator_stage(bot_instance, tracker=None):
                 await tracker.add_error(f"Generator LLM error for item {item_id}")
             continue
             
-        # --- Collect images (multi-photo support, up to 4) ---
-        image_urls: list[str] = []
-
-        # Parse existing image URLs from collector stage
+        # Parse existing image URLs / paths from collector stage
         try:
-            existing_urls = json.loads(existing_image_urls_json) if existing_image_urls_json else []
+            candidate_images = json.loads(existing_image_urls_json) if existing_image_urls_json else []
         except (json.JSONDecodeError, TypeError):
-            existing_urls = []
+            candidate_images = []
 
-        if source_type == 'reddit':
-            reddit_images = await fetch_reddit_images(summary, url)
-            image_urls.extend(reddit_images)
-
-        # Add collector-stage images that aren't already in the list
-        for eu in existing_urls:
-            if eu and eu not in image_urls and len(image_urls) < 4:
-                image_urls.append(eu)
-
-        # Try OG images if we still don't have enough
-        if len(image_urls) < 4:
-            og_images = await fetch_og_images(url)
-            for og in og_images:
-                if og not in image_urls and len(image_urls) < 4:
-                    image_urls.append(og)
-
+        image_urls = filter_valid_local_images(candidate_images)
         status = 'pending_review'
-        if not image_urls:
-            if category != 'model_release':
-                status = 'skipped_no_image'
-                
         image_urls_json = json.dumps(image_urls)
                 
         auto_published = False
-        if status == 'pending_review':
+        if config.auto_publish:
             async with get_db_connection() as db:
                 async with db.execute("SELECT auto_publish_categories FROM bot_state WHERE id = 1") as c:
                     auto_cats = (await c.fetchone())[0]
@@ -138,7 +123,8 @@ async def run_generator_stage(bot_instance, tracker=None):
             await send_auto_published_to_group(bot_instance, item_id, category, url, post.post_html, image_urls)
             if tracker:
                 await tracker.add_items_auto_published(1)
-        elif status == 'pending_review':
+        else:
+            # Strictly send to admin for review in PM
             from bot.telegram.handlers import send_draft_to_admin
             await send_draft_to_admin(bot_instance, item_id, post.post_html, image_urls)
             if tracker:

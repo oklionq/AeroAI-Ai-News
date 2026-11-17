@@ -1,18 +1,28 @@
+import os
 import asyncio
 import json
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramRetryAfter
-from aiogram.types import InputMediaPhoto
+from aiogram.types import InputMediaPhoto, InputMediaVideo, FSInputFile
 from bot.config import config
 from bot.telegram.keyboards import get_main_keyboard, get_review_keyboard
-from bot.telegram.formatting import safe_format
+from bot.telegram.formatting import safe_format, safe_caption
 from bot.services.stats_service import get_stats
 from bot.db import get_db_connection
 from bot.utils.logger import logger
 
 dp = Dispatcher()
 
+def to_media_input(src: str):
+    """Преобразует строку пути к файлу или URL в подходящий для aiogram тип."""
+    if isinstance(src, str) and os.path.exists(src):
+        return FSInputFile(src)
+    return src
+
+def is_video(path: str) -> bool:
+    """Проверяет, является ли файл видео по расширению."""
+    return str(path).lower().endswith(('.mp4', '.mov', '.webm', '.mkv'))
 
 # ---------------------------------------------------------------------------
 # Sending draft to admin (supports 0, 1, or 2+ photos)
@@ -20,10 +30,10 @@ dp = Dispatcher()
 
 async def send_draft_to_admin(bot: Bot, item_id: int, post_text: str, image_urls: list[str] | None):
     """
-    Send a news draft to admin for review.
-    - 0 images: text message with inline buttons
-    - 1 image: sendPhoto with caption + inline buttons
-    - 2+ images: sendMediaGroup (album, no buttons) + separate text message with inline buttons
+    Отправляет черновик поста администратору в ЛС на проверку.
+    Медиа (фото или видео) и текст ВСЕГДА отправляются вместе в ОДНОМ сообщении:
+    - При наличии медиа: sendPhoto / sendVideo с текстом в caption и кнопками одобрить/отклонить.
+    - Без медиа: send_message с текстом и кнопками.
     """
     if image_urls is None:
         image_urls = []
@@ -31,82 +41,46 @@ async def send_draft_to_admin(bot: Bot, item_id: int, post_text: str, image_urls
     markup = get_review_keyboard(item_id)
 
     try:
-        if len(image_urls) >= 2:
-            # --- Album mode ---
-            media = [InputMediaPhoto(media=url) for url in image_urls[:4]]
-            album_messages = await bot.send_media_group(
-                chat_id=config.admin_chat_id,
-                media=media
-            )
+        if image_urls:
+            main_media = image_urls[0]
+            if len(image_urls) > 1:
+                note = f"\n\n<i>📸 В посте {len(image_urls)} медиа (будут опубликованы вместе)</i>"
+                caption = safe_caption(post_text, max_len=1024 - len(note)) + note
+            else:
+                caption = safe_caption(post_text, max_len=1024)
 
-            # Save file_ids from Telegram's response (largest size = last in .photo list)
-            file_ids = []
-            album_msg_ids = []
-            for msg in album_messages:
-                album_msg_ids.append(msg.message_id)
-                if msg.photo:
-                    file_ids.append(msg.photo[-1].file_id)
-
-            # Send control message with full text + buttons
-            text = safe_format(post_text, max_len=4096)
-            control_msg = await bot.send_message(
-                chat_id=config.admin_chat_id,
-                text=text,
-                parse_mode="HTML",
-                reply_markup=markup,
-                disable_web_page_preview=True
-            )
-
-            # Persist file_ids, album message IDs, and control message ID
-            async with get_db_connection() as db:
-                await db.execute("""
-                    UPDATE news_items 
-                    SET image_file_ids = ?, telegram_album_message_ids = ?, telegram_control_message_id = ?
-                    WHERE id = ?
-                """, (json.dumps(file_ids), json.dumps(album_msg_ids), control_msg.message_id, item_id))
-                await db.commit()
-
-        elif len(image_urls) == 1:
-            # --- Single photo mode ---
-            text = safe_format(post_text, max_len=1024)
-            if len(post_text) > 1024:
-                # Caption too long for photo — send as text instead
-                control_msg = await bot.send_message(
+            if is_video(main_media):
+                msg = await bot.send_video(
                     chat_id=config.admin_chat_id,
-                    text=safe_format(post_text, max_len=4096),
+                    video=to_media_input(main_media),
+                    caption=caption,
                     parse_mode="HTML",
                     reply_markup=markup,
-                    disable_web_page_preview=True
+                    supports_streaming=True
                 )
-                async with get_db_connection() as db:
-                    await db.execute(
-                        "UPDATE news_items SET telegram_control_message_id = ? WHERE id = ?",
-                        (control_msg.message_id, item_id)
-                    )
-                    await db.commit()
+                file_ids = [msg.video.file_id] if msg.video else []
             else:
                 msg = await bot.send_photo(
                     chat_id=config.admin_chat_id,
-                    photo=image_urls[0],
-                    caption=text,
+                    photo=to_media_input(main_media),
+                    caption=caption,
                     parse_mode="HTML",
                     reply_markup=markup
                 )
-                # Save file_id for reuse during publishing
                 file_ids = [msg.photo[-1].file_id] if msg.photo else []
-                async with get_db_connection() as db:
-                    await db.execute("""
-                        UPDATE news_items 
-                        SET image_file_ids = ?, telegram_control_message_id = ?
-                        WHERE id = ?
-                    """, (json.dumps(file_ids), msg.message_id, item_id))
-                    await db.commit()
+
+            async with get_db_connection() as db:
+                await db.execute("""
+                    UPDATE news_items 
+                    SET image_file_ids = ?, telegram_control_message_id = ?
+                    WHERE id = ?
+                """, (json.dumps(file_ids), msg.message_id, item_id))
+                await db.commit()
         else:
-            # --- No image mode ---
-            text = safe_format(post_text, max_len=4096)
+            # Текстовый пост без фото
             control_msg = await bot.send_message(
                 chat_id=config.admin_chat_id,
-                text=text,
+                text=safe_format(post_text, max_len=4096),
                 parse_mode="HTML",
                 reply_markup=markup,
                 disable_web_page_preview=True
@@ -123,7 +97,7 @@ async def send_draft_to_admin(bot: Bot, item_id: int, post_text: str, image_urls
         await asyncio.sleep(e.retry_after)
         await send_draft_to_admin(bot, item_id, post_text, image_urls)
     except Exception as e:
-        logger.error(f"Failed to send draft for item {item_id}: {e}")
+        logger.error(f"Failed to send draft for item {item_id}: {e}", exc_info=True)
         # fallback: retry without images
         if image_urls:
             await send_draft_to_admin(bot, item_id, post_text, [])
@@ -137,7 +111,14 @@ async def send_draft_to_admin(bot: Bot, item_id: int, post_text: str, image_urls
 async def cmd_start(message: types.Message):
     if message.from_user.id != config.admin_chat_id:
         return
-    await message.answer("AI News Agent запущен.", reply_markup=get_main_keyboard())
+    await message.answer(
+        f"🤖 <b>AI News Agent готов к работе</b>\n\n"
+        f"Источник: @{config.donor_channel}\n"
+        f"Модель: <code>{config.filter_model}</code> (Venice AI)\n"
+        f"Все посты направляются в этот диалог для вашей проверки.",
+        reply_markup=get_main_keyboard(),
+        parse_mode="HTML"
+    )
 
 @dp.message(Command("stats"))
 @dp.message(F.text == "📊 Статистика")
@@ -146,18 +127,33 @@ async def cmd_stats(message: types.Message):
         return
     
     stats = await get_stats()
+    
+    # Reasons text
+    reasons_text = ""
+    if stats.get('reject_reasons'):
+        reason_map = {
+            "not_important": "Не важно",
+            "weak_text": "Слабый текст",
+            "duplicate": "Дубликат",
+            "other": "Другое"
+        }
+        reasons_list = [f"  • {reason_map.get(k, k)}: {v}" for k, v in stats['reject_reasons'].items()]
+        reasons_text = "\n<i>Причины отклонения:</i>\n" + "\n".join(reasons_list)
+
     text = (
-        f"<b>Статистика:</b>\n"
-        f"Всего собрано: {stats['total_collected']} ({stats['collected_24h']} за 24ч)\n"
-        f"Прошло фильтр: {stats['passed_filter']}\n"
-        f"Отсеяно (мусор): {stats['filtered_out']}\n"
-        f"В ожидании: {stats['pending_review']}\n"
-        f"Одобрено/Опубликовано: {stats['approved']}\n"
-        f"Отклонено: {stats['rejected']}\n\n"
-        f"<b>Бюджет OpenAI:</b>\n"
-        f"Всего токенов: {stats['total_tokens']}\n"
-        f"Потрачено: ${stats['budget_spent']:.2f} / ${config.max_budget_usd:.2f}\n"
-        f"За текущий месяц: ${stats['cost_this_month']:.2f}\n"
+        f"📊 <b>Полная статистика:</b>\n\n"
+        f"<b>Посты (@{config.donor_channel}):</b>\n"
+        f"— Всего собрано: <b>{stats['total_collected']}</b> (за 24ч: {stats['collected_24h']})\n"
+        f"— Прошло фильтр важности: <b>{stats['passed_filter']}</b>\n"
+        f"— Отсеяно фильтром: <b>{stats['filtered_out']}</b>\n"
+        f"— В очереди на модерацию: <b>{stats['pending_review']}</b>\n"
+        f"— Одобрено и опубликовано: <b>{stats['approved']}</b>\n"
+        f"— Отклонено: <b>{stats['rejected']}</b>{reasons_text}\n\n"
+        f"<b>LLM и Бюджет (Venice AI):</b>\n"
+        f"— Модель: <code>{config.filter_model}</code>\n"
+        f"— Использовано токенов: <b>{stats['total_tokens']:,}</b>\n"
+        f"— Потрачено: <b>${stats['budget_spent']:.3f}</b> / ${config.max_budget_usd:.2f}\n"
+        f"— Расход за этот месяц: <b>${stats['cost_this_month']:.3f}</b>\n"
     )
     await message.answer(text, parse_mode="HTML")
 
@@ -168,12 +164,14 @@ async def cmd_status(message: types.Message):
         return
         
     stats = await get_stats()
-    status_text = "Пауза" if stats['is_paused'] else "Активен"
+    status_text = "⏸ На паузе" if stats['is_paused'] else "▶️ Активен"
     reason = f" ({stats['pause_reason']})" if stats['pause_reason'] else ""
     
     text = (
-        f"<b>Статус:</b> {status_text}{reason}\n"
-        # Can add uptime and error counts from DB here
+        f"⚙️ <b>Статус бота:</b> {status_text}{reason}\n"
+        f"Канал-донор: <b>@{config.donor_channel}</b>\n"
+        f"Интервал опроса: <b>{config.poll_interval_minutes} мин.</b>\n"
+        f"Режим публикации: <b>Премодерация в ЛС</b>\n"
     )
     await message.answer(text, parse_mode="HTML")
 
@@ -184,25 +182,25 @@ async def cmd_queue(message: types.Message):
         return
         
     async with get_db_connection() as db:
-        async with db.execute("SELECT title, collected_at FROM news_items WHERE status = 'pending_review' ORDER BY collected_at ASC LIMIT 20") as cur:
+        async with db.execute("SELECT id, title, collected_at FROM news_items WHERE status = 'pending_review' ORDER BY collected_at ASC LIMIT 20") as cur:
             items = await cur.fetchall()
             
     if not items:
-        await message.answer("Очередь пуста.")
+        await message.answer("🗂 Очередь модерации пуста.")
         return
         
     from zoneinfo import ZoneInfo
     from datetime import datetime, timezone
     tz = ZoneInfo(config.display_timezone)
     
-    text = "<b>Очередь модерации:</b>\n\n"
-    for title, collected_at in items:
+    text = f"🗂 <b>Очередь модерации ({len(items)}):</b>\n\n"
+    for item_id, title, collected_at in items:
         try:
             dt = datetime.strptime(collected_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            local_time = dt.astimezone(tz).strftime("%d.%m.%Y %H:%M:%S")
+            local_time = dt.astimezone(tz).strftime("%d.%m %H:%M")
         except:
-            local_time = collected_at
-        text += f"— {title} <i>({local_time})</i>\n"
+            local_time = collected_at or ""
+        text += f"• <b>[#{item_id}]</b> {title[:50]}... <i>({local_time})</i>\n"
         
     await message.answer(text, parse_mode="HTML")
 
@@ -263,21 +261,19 @@ async def cmd_cycle(message: types.Message):
      
     if status == 'running':
         await message.answer(
-            f"⏳ Цикл парсинга выполняется сейчас\nНачат: {format_time(started_at)}"
+            f"⏳ Цикл парсинга выполняется прямо сейчас...\nНачат: {format_time(started_at)}"
         )
         return
         
-    text = f"🔄 <b>Последний цикл парсинга</b>\n\n"
+    text = f"🔄 <b>Последний цикл парсинга (@{config.donor_channel})</b>\n\n"
     text += f"Завершён: {format_time(finished_at)}\n"
     text += f"Длительность: {duration} сек\n\n"
-    text += f"Источники: {sources_ok}/{sources_total} успешно\n"
-    text += f"Новых записей найдено: {items_raw}\n"
+    text += f"Новых сообщений найдено: {items_raw}\n"
     if items_filtered_stale is not None:
-        text += f"Отсеяно как устаревшие: {items_filtered_stale}\n"
-    text += f"После проверки на дубли: {items_after_dedup}\n"
+        text += f"Отсеяно (устаревшие): {items_filtered_stale}\n"
+    text += f"После дедупликации: {items_after_dedup}\n"
     text += f"Прошло фильтр важности: {items_passed_filter}\n"
-    text += f"Отправлено на модерацию: {items_sent_moderation}\n"
-    text += f"Авто-опубликовано: {items_auto_published}\n"
+    text += f"Отправлено вам на проверку: {items_sent_moderation}\n"
     text += f"Ошибок за цикл: {errors_count}"
     
     if errors_count > 0 and last_errors_json:
@@ -290,7 +286,7 @@ async def cmd_cycle(message: types.Message):
             
     text += "\n\n"
     if is_paused:
-        text += "⏸ Агент на паузе — следующий цикл не запланирован. Возобновить: /resume"
+        text += "⏸ Агент на паузе. Возобновить: /resume"
     else:
         text += f"⏭ Следующий цикл: {format_time(next_poll_at_str)} (через {format_relative(next_poll_at_str)})"
         
@@ -311,10 +307,8 @@ async def cmd_pause_resume(message: types.Message):
         reason = 'manual' if new_state else None
         
         if new_state:
-            # Paused
             await db.execute("UPDATE bot_state SET is_paused = ?, pause_reason = ?, next_poll_at = NULL WHERE id = 1", (new_state, reason))
         else:
-            # Resumed
             from datetime import datetime, timezone
             import datetime as dt
             now = datetime.now(timezone.utc)
@@ -331,13 +325,13 @@ async def cmd_pause_resume(message: types.Message):
 
 
 # ---------------------------------------------------------------------------
-# Review callbacks (approve / reject) — supports album + control message
+# Review callbacks (approve / reject)
 # ---------------------------------------------------------------------------
 
 @dp.callback_query(F.data.startswith("act:"))
 async def on_review_action(callback: types.CallbackQuery, bot: Bot):
     if callback.from_user.id != config.admin_chat_id:
-        await callback.answer("Access denied", show_alert=True)
+        await callback.answer("Доступ запрещён", show_alert=True)
         return
         
     _, item_id_str, action = callback.data.split(":")
@@ -351,7 +345,7 @@ async def on_review_action(callback: types.CallbackQuery, bot: Bot):
             row = await cur.fetchone()
             
     if not row:
-        await callback.answer("Item not found", show_alert=True)
+        await callback.answer("Новость не найдена", show_alert=True)
         return
         
     status, post_text, image_urls_json, image_file_ids_json, category, url = row
@@ -394,109 +388,85 @@ async def on_review_action(callback: types.CallbackQuery, bot: Bot):
             thread_id = config.default_topic_id
             logger.info(f"Категория '{category}' не найдена в TOPIC_MAPPING. Используем DEFAULT_TOPIC_ID ({thread_id}).")
         
+        caption_text = safe_caption(post_text, max_len=1024)
+
         try:
-            if len(image_file_ids) >= 2:
-                # --- Publish album using saved file_ids ---
-                media = [InputMediaPhoto(media=fid) for fid in image_file_ids[:4]]
-                await bot.send_media_group(
-                    chat_id=config.target_group_id,
-                    message_thread_id=thread_id,
-                    media=media
-                )
-                # Send text as separate message
-                text = safe_format(post_text, max_len=4096)
-                await bot.send_message(
-                    chat_id=config.target_group_id,
-                    message_thread_id=thread_id,
-                    text=text,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
-                )
-
-            elif len(image_file_ids) == 1:
-                text = safe_format(post_text, max_len=1024)
-                if len(post_text) > 1024:
-                    # Caption too long — send text only
-                    await bot.send_message(
+            published_msg_id = None
+            if image_urls:
+                if len(image_urls) >= 2:
+                    # Публикуем альбом: текст прикреплён к ПЕРВОМУ элементу (единый пост)
+                    media = []
+                    for i, u in enumerate(image_urls[:4]):
+                        cap = caption_text if i == 0 else None
+                        pm = "HTML" if i == 0 else None
+                        if is_video(u):
+                            media.append(InputMediaVideo(
+                                media=to_media_input(u),
+                                caption=cap,
+                                parse_mode=pm,
+                                supports_streaming=True
+                            ))
+                        else:
+                            media.append(InputMediaPhoto(
+                                media=to_media_input(u),
+                                caption=cap,
+                                parse_mode=pm
+                            ))
+                    published_msgs = await bot.send_media_group(
                         chat_id=config.target_group_id,
                         message_thread_id=thread_id,
-                        text=safe_format(post_text, max_len=4096),
-                        parse_mode="HTML",
-                        disable_web_page_preview=True
+                        media=media
                     )
+                    published_msg_id = published_msgs[0].message_id
                 else:
-                    await bot.send_photo(
-                        chat_id=config.target_group_id,
-                        message_thread_id=thread_id,
-                        photo=image_file_ids[0],
-                        caption=text,
-                        parse_mode="HTML"
-                    )
-
-            elif len(image_urls) >= 2:
-                # Fallback: no file_ids saved, use original URLs
-                media = [InputMediaPhoto(media=u) for u in image_urls[:4]]
-                await bot.send_media_group(
-                    chat_id=config.target_group_id,
-                    message_thread_id=thread_id,
-                    media=media
-                )
-                text = safe_format(post_text, max_len=4096)
-                await bot.send_message(
-                    chat_id=config.target_group_id,
-                    message_thread_id=thread_id,
-                    text=text,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
-                )
-
-            elif len(image_urls) == 1:
-                text = safe_format(post_text, max_len=1024)
-                if len(post_text) > 1024:
-                    await bot.send_message(
-                        chat_id=config.target_group_id,
-                        message_thread_id=thread_id,
-                        text=safe_format(post_text, max_len=4096),
-                        parse_mode="HTML",
-                        disable_web_page_preview=True
-                    )
-                else:
-                    await bot.send_photo(
-                        chat_id=config.target_group_id,
-                        message_thread_id=thread_id,
-                        photo=image_urls[0],
-                        caption=text,
-                        parse_mode="HTML"
-                    )
+                    # Одиночное медиа (видео или фото) с текстом в caption
+                    if is_video(image_urls[0]):
+                        published_msg = await bot.send_video(
+                            chat_id=config.target_group_id,
+                            message_thread_id=thread_id,
+                            video=to_media_input(image_urls[0]),
+                            caption=caption_text,
+                            parse_mode="HTML",
+                            supports_streaming=True
+                        )
+                    else:
+                        published_msg = await bot.send_photo(
+                            chat_id=config.target_group_id,
+                            message_thread_id=thread_id,
+                            photo=to_media_input(image_urls[0]),
+                            caption=caption_text,
+                            parse_mode="HTML"
+                        )
+                    published_msg_id = published_msg.message_id
             else:
-                # No images
-                text = safe_format(post_text, max_len=4096)
-                await bot.send_message(
+                # Без картинок — текстовое сообщение
+                published_msg = await bot.send_message(
                     chat_id=config.target_group_id,
                     message_thread_id=thread_id,
-                    text=text,
+                    text=safe_format(post_text, max_len=4096),
                     parse_mode="HTML",
                     disable_web_page_preview=True
                 )
+                published_msg_id = published_msg.message_id
                 
             async with get_db_connection() as db:
                 await db.execute("""
                     UPDATE news_items 
-                    SET status = 'published', decision_at = CURRENT_TIMESTAMP 
+                    SET status = 'published', decision_at = CURRENT_TIMESTAMP, telegram_message_id = ?
                     WHERE id = ?
-                """, (item_id,))
+                """, (published_msg_id, item_id))
                 await db.commit()
                 
-            # Update control message to show "Published" status
+            # Обновляем контрольное сообщение в ЛС
             if callback.message.caption:
-                await callback.message.edit_caption(caption=callback.message.caption + "\n\n✅ Опубликовано")
+                await callback.message.edit_caption(caption=callback.message.caption + "\n\n✅ Опубликовано в канал")
             else:
-                await callback.message.edit_text(text=callback.message.text + "\n\n✅ Опубликовано")
+                await callback.message.edit_text(text=callback.message.text + "\n\n✅ Опубликовано в канал")
                 
-            await callback.answer("Опубликовано")
+            await callback.answer("Опубликовано!")
             
         except Exception as e:
-            logger.error(f"Publishing failed for item {item_id}: {e}")
+            logger.error(f"Publishing failed for item {item_id}: {e}", exc_info=True)
             await callback.answer(f"Ошибка публикации: {e}", show_alert=True)
 
 @dp.callback_query(F.data.startswith("reason:"))
@@ -522,9 +492,10 @@ async def on_reject_reason(callback: types.CallbackQuery):
         "other": "Другое"
     }
     
+    reason_title = reason_map.get(reason, reason)
     if callback.message.caption:
-        await callback.message.edit_caption(caption=callback.message.caption + f"\n\n❌ Отклонено ({reason_map.get(reason, reason)})")
+        await callback.message.edit_caption(caption=callback.message.caption + f"\n\n❌ Отклонено ({reason_title})")
     else:
-        await callback.message.edit_text(text=callback.message.text + f"\n\n❌ Отклонено ({reason_map.get(reason, reason)})")
+        await callback.message.edit_text(text=callback.message.text + f"\n\n❌ Отклонено ({reason_title})")
         
-    await callback.answer("Отклонено")
+    await callback.answer(f"Отклонено: {reason_title}")

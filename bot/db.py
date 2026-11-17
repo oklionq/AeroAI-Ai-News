@@ -8,8 +8,10 @@ from bot.utils.logger import logger
 DB_PATH = config.database_url if config.database_url else os.path.join("data", "bot.db")
 
 async def init_db():
-    if not config.database_url:
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    dir_name = os.path.dirname(DB_PATH)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+    os.makedirs(os.path.join("data", "temp_media"), exist_ok=True)
     
     async with aiosqlite.connect(DB_PATH) as db:
         # sources table
@@ -23,6 +25,7 @@ async def init_db():
                 fail_count INTEGER DEFAULT 0,
                 last_success_at DATETIME,
                 last_error TEXT,
+                disabled_at DATETIME,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -32,6 +35,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS news_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_id INTEGER,
+                telegram_source_msg_id INTEGER,
                 url TEXT NOT NULL,
                 url_hash TEXT NOT NULL,
                 title_hash TEXT NOT NULL,
@@ -43,6 +47,7 @@ async def init_db():
                 filter_category TEXT,
                 subject TEXT,
                 filter_reason TEXT,
+                filter_confidence REAL,
                 image_urls TEXT DEFAULT '[]',
                 image_file_ids TEXT DEFAULT '[]',
                 post_text_json TEXT,
@@ -50,6 +55,9 @@ async def init_db():
                 telegram_album_message_ids TEXT DEFAULT '[]',
                 telegram_control_message_id INTEGER,
                 thread_id INTEGER,
+                auto_published BOOLEAN DEFAULT 0,
+                decision_at DATETIME,
+                reject_reason TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
@@ -87,6 +95,7 @@ async def init_db():
                 is_paused BOOLEAN DEFAULT 0,
                 pause_reason TEXT,
                 budget_spent_usd REAL DEFAULT 0.0,
+                auto_publish_categories TEXT DEFAULT '',
                 last_poll_at DATETIME,
                 next_poll_at DATETIME,
                 started_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -121,26 +130,6 @@ async def init_db():
             VALUES (1, 0, 0.0)
         """)
         
-        # Insert initial sources if table is empty
-        async with db.execute("SELECT COUNT(*) FROM sources") as cursor:
-            row = await cursor.fetchone()
-            if row[0] == 0:
-                sources = [
-                    ("OpenAI News", "rss", "https://openai.com/news/rss.xml"),
-                    ("Hugging Face Blog", "rss", "https://huggingface.co/blog/feed.xml"),
-                    ("Google DeepMind Blog", "rss", "https://deepmind.google/blog/rss.xml"), # Placeholder URL
-                    ("TechCrunch AI", "rss", "https://techcrunch.com/category/artificial-intelligence/feed/"),
-                    ("VentureBeat AI", "rss", "https://venturebeat.com/category/ai/feed/"),
-                    ("Reddit Singularity", "reddit", "https://www.reddit.com/r/singularity/.rss"),
-                    ("Reddit LocalLLaMA", "reddit", "https://www.reddit.com/r/LocalLLaMA/.rss"),
-                    ("Reddit OpenAI", "reddit", "https://www.reddit.com/r/OpenAI/.rss"),
-                    ("Hacker News AI", "hackernews", "http://hn.algolia.com/api/v1/search_by_date?query=GPT%20OR%20Claude%20OR%20Gemini%20OR%20Grok%20OR%20OpenAI%20OR%20Anthropic&tags=story")
-                ]
-                await db.executemany("""
-                    INSERT INTO sources (name, type, url) VALUES (?, ?, ?)
-                """, sources)
-        
-        
         # Migrations for new columns
         for col_query in [
             "ALTER TABLE news_items ADD COLUMN decision_at DATETIME",
@@ -148,33 +137,29 @@ async def init_db():
             "ALTER TABLE news_items ADD COLUMN filter_confidence REAL",
             "ALTER TABLE news_items ADD COLUMN auto_published BOOLEAN DEFAULT 0",
             "ALTER TABLE news_items ADD COLUMN subject TEXT",
+            "ALTER TABLE news_items ADD COLUMN telegram_source_msg_id INTEGER",
             "ALTER TABLE sources ADD COLUMN disabled_at DATETIME",
             "ALTER TABLE poll_cycles ADD COLUMN items_filtered_stale INTEGER DEFAULT 0",
             "ALTER TABLE news_items ADD COLUMN image_urls TEXT DEFAULT '[]'",
             "ALTER TABLE news_items ADD COLUMN image_file_ids TEXT DEFAULT '[]'",
             "ALTER TABLE news_items ADD COLUMN telegram_album_message_ids TEXT DEFAULT '[]'",
             "ALTER TABLE news_items ADD COLUMN telegram_control_message_id INTEGER",
+            "ALTER TABLE bot_state ADD COLUMN auto_publish_categories TEXT DEFAULT ''"
         ]:
             try:
                 await db.execute(col_query)
             except Exception:
                 pass
             
-        try:
-            await db.execute("ALTER TABLE bot_state ADD COLUMN auto_publish_categories TEXT DEFAULT ''")
-        except Exception:
-            pass
-        
-        # Migrate legacy image_url -> image_urls (one-time, for existing rows)
-        try:
-            await db.execute("""
-                UPDATE news_items 
-                SET image_urls = json_array(image_url) 
-                WHERE image_url IS NOT NULL AND image_url != '' 
-                AND (image_urls IS NULL OR image_urls = '[]')
-            """)
-        except Exception:
-            pass
+        # Clean up legacy web sources and configure single donor channel
+        await db.execute("DELETE FROM sources WHERE type != 'telegram_channel'")
+        async with db.execute("SELECT COUNT(*) FROM sources WHERE type = 'telegram_channel'") as cursor:
+            row = await cursor.fetchone()
+            if row[0] == 0:
+                await db.execute("""
+                    INSERT INTO sources (id, name, type, url, enabled)
+                    VALUES (1, ?, 'telegram_channel', ?, 1)
+                """, (config.donor_channel, f"https://t.me/{config.donor_channel}"))
 
         await db.commit()
 

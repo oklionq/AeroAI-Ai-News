@@ -1,28 +1,45 @@
 import asyncio
 import json
+import re
 from openai import AsyncOpenAI
 from bot.config import config
 from bot.models import FilterResult, GeneratedPost
 from bot.utils.logger import logger
 from bot.db import get_db_connection
 
-client = AsyncOpenAI(api_key=config.openai_api_key)
+client = AsyncOpenAI(
+    api_key=config.openai_api_key,
+    base_url=config.openai_base_url
+)
 
-# PRICING (USD per 1M tokens) - Update manually if needed
+# PRICING (USD per 1M tokens)
 PRICING = {
+    "deepseek-v4-1-flash-1017-uncensored": {"input": 0.150, "output": 0.600},
     "gpt-4o-mini": {"input": 0.150, "output": 0.600},
-    "gpt-4.1-nano": {"input": 0.150, "output": 0.600}, # Assuming same for nano
+    "gpt-4.1-nano": {"input": 0.150, "output": 0.600},
     "gpt-4.1-mini": {"input": 0.150, "output": 0.600},
 }
+
+def _clean_json_string(raw: str) -> str:
+    """Удаляет маркдаун блоки ```json ... ``` и пробелы."""
+    raw = raw.strip()
+    match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    # Если просто начинается с { и заканчивается }
+    match_braces = re.search(r'(\{.*\})', raw, re.DOTALL)
+    if match_braces:
+        return match_braces.group(1).strip()
+    return raw
 
 async def track_usage(stage: str, model: str, usage, news_item_id: int = None):
     if not usage:
         return
     
-    input_tokens = usage.prompt_tokens
-    output_tokens = usage.completion_tokens
+    input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+    output_tokens = getattr(usage, "completion_tokens", 0) or 0
     
-    model_pricing = PRICING.get(model, PRICING["gpt-4o-mini"])
+    model_pricing = PRICING.get(model, PRICING["deepseek-v4-1-flash-1017-uncensored"])
     cost = (input_tokens / 1_000_000 * model_pricing["input"]) + \
            (output_tokens / 1_000_000 * model_pricing["output"])
            
@@ -42,38 +59,56 @@ async def get_filter_decision(title: str, summary: str, news_item_id: int) -> Fi
     model = config.filter_model
     prompt = f"Title: {title}\n\nSummary: {summary}"
     
-    try:
-        response = await client.beta.chat.completions.parse(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You are an AI news filter. Determine if the news is important based on these exact criteria: 1. model_release (release of a new model by a major AI lab). 2. feature_update (major new FLAGSHIP update to an existing product, not incremental). 3. benchmark_comparison (comparison with specific numbers). 4. pricing_or_availability (changes to prices or limits). 5. regulatory_or_political (direct impact on model availability or restrictions). 6. competitive_intel (credible info about competitors' progress). Exclude: partnerships, financial/corporate news, safety/influence reports, research programs, infrastructure/datacenters, and minor incremental features. Provide a confidence score (0.0 to 1.0). For Reddit/community rumors without official links, assign confidence < 0.6. You MUST extract the `subject` as the canonical product/model name."},
-                {"role": "user", "content": prompt}
-            ],
-            response_format=FilterResult,
-        )
-        
-        await track_usage("filter", model, response.usage, news_item_id)
-        return response.choices[0].message.parsed
-    except Exception as e:
-        logger.error(f"OpenAI filter error for item {news_item_id}: {e}")
-        # One retry
+    system_prompt = (
+        "You are an AI news filter. Determine if the news is important based on these exact criteria: "
+        "1. model_release (release of a new model by a major AI lab). "
+        "2. feature_update (major new FLAGSHIP update to an existing product, not incremental). "
+        "3. benchmark_comparison (comparison with specific numbers). "
+        "4. pricing_or_availability (changes to prices or limits). "
+        "5. regulatory_or_political (direct impact on model availability or restrictions). "
+        "6. competitive_intel (credible info about competitors' progress). "
+        "Exclude: advertisements, sponsorships, promotional messages, partnerships, financial/corporate rumors, "
+        "and minor incremental features. Provide a confidence score (0.0 to 1.0). "
+        "You MUST extract the `subject` as the canonical product/model name.\n"
+        "Output ONLY a valid JSON object with the following fields:\n"
+        "{\n"
+        '  "is_important": boolean,\n'
+        '  "category": "model_release" | "feature_update" | "benchmark_comparison" | "pricing_or_availability" | "regulatory_or_political" | "competitive_intel" | "other",\n'
+        '  "subject": "string",\n'
+        '  "reason": "1 short sentence explaining the decision",\n'
+        '  "confidence": float between 0.0 and 1.0\n'
+        "}"
+    )
+
+    for attempt in range(2):
         try:
-            response = await client.beta.chat.completions.parse(
+            response = await client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": "You are an AI news filter. Determine if the news is important based on these exact criteria: 1. model_release (release of a new model by a major AI lab). 2. feature_update (major new FLAGSHIP update to an existing product, not incremental). 3. benchmark_comparison (comparison with specific numbers). 4. pricing_or_availability (changes to prices or limits). 5. regulatory_or_political (direct impact on model availability or restrictions). 6. competitive_intel (credible info about competitors' progress). Exclude: partnerships, financial/corporate news, safety/influence reports, research programs, infrastructure/datacenters, and minor incremental features. Provide a confidence score (0.0 to 1.0). For Reddit/community rumors without official links, assign confidence < 0.6. YOU MUST RETURN STRICT JSON FORMAT. You MUST extract the `subject` as the canonical product/model name."},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt}
                 ],
-                response_format=FilterResult,
+                response_format={"type": "json_object"},
+                temperature=0.1
             )
-            await track_usage("filter_retry", model, response.usage, news_item_id)
-            return response.choices[0].message.parsed
-        except Exception as retry_e:
-            logger.error(f"OpenAI filter retry failed for item {news_item_id}: {retry_e}")
-            return None
+            
+            raw_content = response.choices[0].message.content or ""
+            cleaned = _clean_json_string(raw_content)
+            data = json.loads(cleaned)
+            parsed = FilterResult.model_validate(data)
+            
+            await track_usage("filter" if attempt == 0 else "filter_retry", model, response.usage, news_item_id)
+            return parsed
+        except Exception as e:
+            logger.warning(f"Filter attempt {attempt + 1} failed for item {news_item_id}: {e}")
+            if attempt == 1:
+                logger.error(f"Filter all attempts failed for item {news_item_id}: {e}")
+                return None
+            await asyncio.sleep(1)
+
+    return None
 
 async def _check_and_fix_grammar(post_html: str) -> str:
-    import re
     match = re.search(r'<b>(.*?)</b>', post_html)
     if not match:
         return post_html
@@ -87,9 +122,10 @@ async def _check_and_fix_grammar(post_html: str) -> str:
                 {"role": "system", "content": grammar_prompt},
                 {"role": "user", "content": full_title}
             ],
-            max_tokens=100
+            max_tokens=100,
+            temperature=0.1
         )
-        fixed_title = grammar_resp.choices[0].message.content.strip()
+        fixed_title = grammar_resp.choices[0].message.content.strip() if grammar_resp.choices else ""
         if fixed_title and fixed_title != full_title:
             logger.info(f"Грамматическое исправление: '{full_title}' -> '{fixed_title}'")
             return post_html.replace(f"<b>{full_title}</b>", f"<b>{fixed_title}</b>")
@@ -114,56 +150,68 @@ async def generate_post_text(title: str, summary: str, source_name: str, news_it
     elif category == "regulatory_or_political":
         gender_rules = "\nОПОРНОЕ СЛОВО для заголовка: 'закон' (м.р.) или 'регулирование' (ср.р.). Строго согласуй весь заголовок с его родом."
 
-    system_prompt = """
+    length_rule = (
+        "\nКРИТИЧЕСКОЕ ТРЕБОВАНИЕ К ДЛИНЕ ПОСТА: Суммарная длина текста со всеми HTML-тегами "
+        "ОБЯЗАНА быть не более 800-850 символов! Текст будет прикреплён как подпись (caption) к фото/альбому в Telegram. "
+        "Пиши лаконично, плотно и сухо: ровно 1 короткий вводный абзац (2-3 предложения) и блок <blockquote> с 2-3 фактами. "
+        "НЕ добавляй ссылки на источник или внешние каналы в конце поста! Никакой воды и растянутых вступлений!"
+    )
+
+    system_prompt = f"""
 You are a dry, expert AI news writer. Write a Telegram post. Format EXACTLY as below, including all HTML tags:
 
-<b>{эмодзи} {Заголовок в стиле "Вышла X"}</b>
+<b>{{эмодзи}} {{Заголовок в стиле "Вышла X"}}</b>
 
-{1-2 вводных абзаца обычным текстом, без разметки}
+{{1 короткий вводный абзац обычным текстом, без разметки}}
 
-<blockquote>— {факт 1: обязательно с конкретным числом, названием или датой из источника}
-— {факт 2: обязательно с конкретным числом, названием или датой из источника}
-— {факт 3: обязательно с конкретным числом, названием или датой из источника}</blockquote>
+<blockquote>— {{факт 1: обязательно с конкретным числом, названием или датой из источника}}
+— {{факт 2: обязательно с конкретным числом, названием или датой из источника}}
+— {{факт 3: обязательно с конкретным числом, названием или датой из источника}}</blockquote>
 
-{Блок цены/доступности, если есть, обычным текстом}
-
-<a href="{URL источника}">Источник</a>
+{{Короткий блок цены/доступности, если есть, обычным текстом}}
 
 Весь текст поста, включая вводный абзац, пиши строго на русском языке. Не копируй формулировки источника дословно даже частично — перефразируй своими словами.
-You must return strictly valid HTML. If a fact lacks concrete details in the source, DO NOT include it. Do not make up facts!
+ВАЖНО: НЕ добавляй в конце ссылку на источник («Источник» или URL). Ссылок быть не должно!
+You must return strictly valid HTML inside a JSON object with key "post_html".
 Ensure characters <, >, and & in the text itself are escaped so they don't break HTML formatting. DO NOT escape apostrophes (') or quotes (") as &apos; or &quot; - use the symbols directly.
 CRITICAL RULE: NEVER invent, guess, or hallucinate dates, numbers, or names that are not explicitly present in the provided source text. If a date or number is not in the source, simply do not mention it.
-CRITICAL RULE FOR REDDIT SOURCES: Reddit posts are community discussions, not confirmed facts. If the Reddit post contains a direct link to an official source (press release, blog, tweet), use facts ONLY from that official link's context if available. If there is no official link, DO NOT publish specific numbers or dates as confirmed facts; only write what is explicitly stated in the text without making up specifics.""" + gender_rules
+{gender_rules}
+{length_rule}
+
+Output JSON format:
+{{"post_html": "<b>...</b>\\n\\n...\\n\\n<blockquote>...</blockquote>"}}
+"""
     if retry_format:
-        system_prompt += "\nYOU MUST RETURN STRICT JSON FORMAT AND INCLUDE <b>, <blockquote>, AND <a href=...> TAGS."
-    try:
-        response = await client.beta.chat.completions.parse(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            response_format=GeneratedPost,
-        )
-        parsed_post = response.choices[0].message.parsed
-        parsed_post.post_html = await _check_and_fix_grammar(parsed_post.post_html)
-        await track_usage("generation", model, response.usage, news_item_id)
-        return parsed_post
-    except Exception as e:
-        logger.error(f"OpenAI generation error for item {news_item_id}: {e}")
+        system_prompt += "\nYOU MUST RETURN STRICT JSON FORMAT WITH KEY 'post_html' AND INCLUDE <b> AND <blockquote> TAGS. DO NOT INCLUDE SOURCE LINKS."
+
+    for attempt in range(2):
         try:
-            response = await client.beta.chat.completions.parse(
+            response = await client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": system_prompt + "\nYOU MUST RETURN STRICT JSON FORMAT AND EXACT HTML."},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt}
                 ],
-                response_format=GeneratedPost,
+                response_format={"type": "json_object"},
+                temperature=0.2
             )
-            parsed_post = response.choices[0].message.parsed
+            raw_content = response.choices[0].message.content or ""
+            cleaned = _clean_json_string(raw_content)
+            data = json.loads(cleaned)
+            
+            # Handle if model returned {"post_html": "..."} or {"text": "..."}
+            if "post_html" not in data and "text" in data:
+                data["post_html"] = data["text"]
+                
+            parsed_post = GeneratedPost.model_validate(data)
             parsed_post.post_html = await _check_and_fix_grammar(parsed_post.post_html)
-            await track_usage("generation_retry", model, response.usage, news_item_id)
+            await track_usage("generation" if attempt == 0 else "generation_retry", model, response.usage, news_item_id)
             return parsed_post
-        except Exception as retry_e:
-            logger.error(f"OpenAI generation retry failed for item {news_item_id}: {retry_e}")
-            return None
+        except Exception as e:
+            logger.warning(f"Generation attempt {attempt + 1} failed for item {news_item_id}: {e}")
+            if attempt == 1:
+                logger.error(f"Generation all attempts failed for item {news_item_id}: {e}")
+                return None
+            await asyncio.sleep(1)
+
+    return None

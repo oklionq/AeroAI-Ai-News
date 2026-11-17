@@ -3,12 +3,12 @@ import os
 import re
 from aiogram import Bot, types, F
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, InputMediaPhoto
+from aiogram.types import BufferedInputFile, InputMediaPhoto, InputMediaVideo, FSInputFile
 from bot.config import config
 from bot.db import get_db_connection
-from bot.telegram.handlers import dp
+from bot.telegram.handlers import dp, to_media_input, is_video
 from bot.utils.logger import logger
-from bot.telegram.formatting import safe_format
+from bot.telegram.formatting import safe_format, safe_caption
 
 @dp.message(Command("export"))
 async def cmd_export(message: types.Message):
@@ -254,75 +254,77 @@ async def send_auto_published_to_group(bot: Bot, item_id: int, category: str, ur
         thread_id = config.default_topic_id
         logger.info(f"Категория '{category}' не найдена в TOPIC_MAPPING. Используем DEFAULT_TOPIC_ID ({thread_id}) для авто-публикации.")
     
+    caption_text = safe_caption(post_text, max_len=1024)
+
     try:
         published_msg_id = None
+        album_ids = []
 
-        if len(image_urls) >= 2:
-            # Album mode
-            media = [InputMediaPhoto(media=u) for u in image_urls[:4]]
-            album_msgs = await bot.send_media_group(
-                chat_id=config.target_group_id,
-                message_thread_id=thread_id,
-                media=media
-            )
-            text = safe_format(post_text, max_len=4096)
-            text_msg = await bot.send_message(
-                chat_id=config.target_group_id,
-                message_thread_id=thread_id,
-                text=text,
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
-            published_msg_id = text_msg.message_id
-            
-            # Store album message IDs for undo
-            album_ids = [m.message_id for m in album_msgs]
-            async with get_db_connection() as db:
-                await db.execute("""
-                    UPDATE news_items 
-                    SET telegram_message_id = ?, telegram_album_message_ids = ?
-                    WHERE id = ?
-                """, (published_msg_id, json.dumps(album_ids), item_id))
-                await db.commit()
-
-        elif len(image_urls) == 1:
-            if len(post_text) > 1024:
-                msg = await bot.send_message(
+        if image_urls:
+            if len(image_urls) >= 2:
+                # Альбом: текст поста прикреплен к ПЕРВОМУ элементу
+                media = []
+                for i, u in enumerate(image_urls[:4]):
+                    cap = caption_text if i == 0 else None
+                    pm = "HTML" if i == 0 else None
+                    if is_video(u):
+                        media.append(InputMediaVideo(
+                            media=to_media_input(u),
+                            caption=cap,
+                            parse_mode=pm,
+                            supports_streaming=True
+                        ))
+                    else:
+                        media.append(InputMediaPhoto(
+                            media=to_media_input(u),
+                            caption=cap,
+                            parse_mode=pm
+                        ))
+                album_msgs = await bot.send_media_group(
                     chat_id=config.target_group_id,
                     message_thread_id=thread_id,
-                    text=safe_format(post_text, max_len=4096),
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
+                    media=media
                 )
+                published_msg_id = album_msgs[0].message_id
+                album_ids = [m.message_id for m in album_msgs]
             else:
-                text = safe_format(post_text, max_len=1024)
-                msg = await bot.send_photo(
-                    chat_id=config.target_group_id,
-                    message_thread_id=thread_id,
-                    photo=image_urls[0],
-                    caption=text,
-                    parse_mode="HTML"
-                )
-            published_msg_id = msg.message_id
-            
-            async with get_db_connection() as db:
-                await db.execute("UPDATE news_items SET telegram_message_id = ? WHERE id = ?", (published_msg_id, item_id))
-                await db.commit()
-
+                # Одиночное медиа (видео или фото) с текстом в caption
+                if is_video(image_urls[0]):
+                    msg = await bot.send_video(
+                        chat_id=config.target_group_id,
+                        message_thread_id=thread_id,
+                        video=to_media_input(image_urls[0]),
+                        caption=caption_text,
+                        parse_mode="HTML",
+                        supports_streaming=True
+                    )
+                else:
+                    msg = await bot.send_photo(
+                        chat_id=config.target_group_id,
+                        message_thread_id=thread_id,
+                        photo=to_media_input(image_urls[0]),
+                        caption=caption_text,
+                        parse_mode="HTML"
+                    )
+                published_msg_id = msg.message_id
         else:
-            text = safe_format(post_text, max_len=4096)
+            # Без картинок — текстовое сообщение
             msg = await bot.send_message(
                 chat_id=config.target_group_id,
                 message_thread_id=thread_id,
-                text=text,
+                text=safe_format(post_text, max_len=4096),
                 parse_mode="HTML",
                 disable_web_page_preview=True
             )
             published_msg_id = msg.message_id
             
-            async with get_db_connection() as db:
-                await db.execute("UPDATE news_items SET telegram_message_id = ? WHERE id = ?", (published_msg_id, item_id))
-                await db.commit()
+        async with get_db_connection() as db:
+            await db.execute("""
+                UPDATE news_items 
+                SET telegram_message_id = ?, telegram_album_message_ids = ?
+                WHERE id = ?
+            """, (published_msg_id, json.dumps(album_ids), item_id))
+            await db.commit()
             
         # Notify admin with undo button
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -357,7 +359,7 @@ async def cmd_testpost(message: types.Message, bot: Bot):
     test_url_hash = "testhash123"
     test_title_hash = "testhash123"
     test_summary = "Это тестовое саммари новости."
-    test_post_text = "<b>Тестовая новость для проверки публикации</b>\n\nЭто сгенерированный тестовый текст. Если вы нажмете «Опубликовать», он должен попасть в нужную тему (например, AI Новости с ID 13).\n\n<a href='https://example.com/test-news'>Читать далее</a>"
+    test_post_text = "<b>Тестовая новость для проверки публикации</b>\n\nЭто сгенерированный тестовый текст. Если вы нажмете «Опубликовать», он должен попасть в нужную тему (например, AI Новости с ID 13)."
     
     async with get_db_connection() as db:
         async with db.execute("SELECT id FROM sources LIMIT 1") as cur:

@@ -5,3 +5,7 @@ data/
 __pycache__/
 venv/
 .venv/
+
+railway_logs.txt
+*.session
+*.session-journal

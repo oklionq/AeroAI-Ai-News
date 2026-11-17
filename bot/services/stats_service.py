@@ -25,6 +25,16 @@ async def get_stats() -> dict:
             
         async with db.execute("SELECT COUNT(*) FROM news_items WHERE status = 'rejected'") as cur:
             stats['rejected'] = (await cur.fetchone())[0]
+
+        # reject reasons breakdown
+        stats['reject_reasons'] = {}
+        async with db.execute("""
+            SELECT reject_reason, COUNT(*) FROM news_items 
+            WHERE status = 'rejected' AND reject_reason IS NOT NULL
+            GROUP BY reject_reason
+        """) as cur:
+            async for row in cur:
+                stats['reject_reasons'][row[0]] = row[1]
             
         # source stats
         stats['source_stats'] = {}

@@ -2,7 +2,9 @@ from bot.db import get_db_connection
 from bot.services.openai_client import get_filter_decision
 from bot.services.budget_guard import check_budget
 from bot.utils.logger import logger
+from bot.config import config
 import asyncio
+
 async def run_filter_stage(tracker=None):
     if not await check_budget():
         logger.info("Budget exceeded. Skipping filter stage.")
@@ -35,12 +37,11 @@ async def run_filter_stage(tracker=None):
                 new_status = 'pending_generation' if decision.is_important else 'filtered_out'
                 
                 if new_status == 'pending_generation':
-                    from bot.config import config
                     async with db.execute(f"""
                         SELECT id FROM news_items 
                         WHERE status IN ('published', 'approved', 'pending_review', 'pending_generation', 'processing_generation') 
                         AND subject = ? 
-                        AND decision_at >= datetime('now', '-{config.topic_dedup_days} day')
+                        AND coalesce(decision_at, updated_at, created_at) >= datetime('now', '-{config.topic_dedup_days} day')
                         AND id != ?
                     """, (decision.subject, item_id)) as dup_cursor:
                         if await dup_cursor.fetchone():
@@ -49,7 +50,7 @@ async def run_filter_stage(tracker=None):
                             
                 await db.execute("""
                     UPDATE news_items 
-                    SET status = ?, filter_category = ?, filter_reason = ?, filter_confidence = ?, subject = ?, updated_at = CURRENT_TIMESTAMP
+                    SET status = ?, filter_category = ?, filter_reason = ?, filter_confidence = ?, subject = ?, decision_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                 """, (new_status, decision.category, decision.reason, decision.confidence, decision.subject, item_id))
             else:
