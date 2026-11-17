@@ -6,12 +6,13 @@ from bot.config import config
 from bot.utils.logger import logger
 
 DB_PATH = config.database_url if config.database_url else os.path.join("data", "bot.db")
+BASE_DATA_DIR = os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else "data"
+TEMP_MEDIA_DIR = os.path.join(BASE_DATA_DIR, "temp_media")
 
 async def init_db():
-    dir_name = os.path.dirname(DB_PATH)
-    if dir_name:
-        os.makedirs(dir_name, exist_ok=True)
-    os.makedirs(os.path.join("data", "temp_media"), exist_ok=True)
+    if os.path.dirname(DB_PATH):
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    os.makedirs(TEMP_MEDIA_DIR, exist_ok=True)
     
     async with aiosqlite.connect(DB_PATH) as db:
         # sources table

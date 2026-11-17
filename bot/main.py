@@ -118,4 +118,10 @@ async def main():
         await bot.session.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        import traceback
+        logger.critical(f"Fatal error in main: {e}", exc_info=True)
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)

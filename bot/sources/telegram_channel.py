@@ -10,7 +10,8 @@ from telethon.errors import FloodWaitError
 from bot.config import config
 from bot.utils.logger import logger
 
-TEMP_MEDIA_DIR = os.path.join("data", "temp_media")
+BASE_DATA_DIR = os.path.dirname(config.database_url) if config.database_url else "data"
+TEMP_MEDIA_DIR = os.path.join(BASE_DATA_DIR, "temp_media")
 
 AD_MARKERS = [
     r"\berid[:\s]",

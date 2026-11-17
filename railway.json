@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python -u -m bot.main",
+    "startCommand": "/bin/sh -c 'if [ -f /opt/venv/bin/python ]; then /opt/venv/bin/python -u -m bot.main; else python -u -m bot.main; fi'",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }
