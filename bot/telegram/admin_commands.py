@@ -280,32 +280,82 @@ async def send_auto_published_to_group(bot: Bot, item_id: int, category: str, ur
                             caption=cap,
                             parse_mode=pm
                         ))
-                album_msgs = await bot.send_media_group(
-                    chat_id=config.target_group_id,
-                    message_thread_id=thread_id,
-                    media=media
-                )
-                published_msg_id = album_msgs[0].message_id
-                album_ids = [m.message_id for m in album_msgs]
+                try:
+                    album_msgs = await bot.send_media_group(
+                        chat_id=config.target_group_id,
+                        message_thread_id=thread_id,
+                        media=media
+                    )
+                    published_msg_id = album_msgs[0].message_id
+                    album_ids = [m.message_id for m in album_msgs]
+                except Exception as ae:
+                    if "video as photo" in str(ae).lower():
+                        logger.warning(f"send_media_group failed with video-as-photo for auto-publish item {item_id}, converting photos to videos...")
+                        retry_media = []
+                        for itm in media:
+                            if isinstance(itm, InputMediaPhoto):
+                                retry_media.append(InputMediaVideo(
+                                    media=itm.media,
+                                    caption=itm.caption,
+                                    parse_mode=itm.parse_mode,
+                                    supports_streaming=True
+                                ))
+                            else:
+                                retry_media.append(itm)
+                        album_msgs = await bot.send_media_group(
+                            chat_id=config.target_group_id,
+                            message_thread_id=thread_id,
+                            media=retry_media
+                        )
+                        published_msg_id = album_msgs[0].message_id
+                        album_ids = [m.message_id for m in album_msgs]
+                    else:
+                        raise
             else:
                 # Одиночное медиа (видео или фото) с текстом в caption
-                if is_video(image_urls[0]):
-                    msg = await bot.send_video(
-                        chat_id=config.target_group_id,
-                        message_thread_id=thread_id,
-                        video=to_media_input(image_urls[0]),
-                        caption=caption_text,
-                        parse_mode="HTML",
-                        supports_streaming=True
-                    )
-                else:
-                    msg = await bot.send_photo(
-                        chat_id=config.target_group_id,
-                        message_thread_id=thread_id,
-                        photo=to_media_input(image_urls[0]),
-                        caption=caption_text,
-                        parse_mode="HTML"
-                    )
+                is_vid = is_video(image_urls[0])
+                try:
+                    if is_vid:
+                        msg = await bot.send_video(
+                            chat_id=config.target_group_id,
+                            message_thread_id=thread_id,
+                            video=to_media_input(image_urls[0]),
+                            caption=caption_text,
+                            parse_mode="HTML",
+                            supports_streaming=True
+                        )
+                    else:
+                        msg = await bot.send_photo(
+                            chat_id=config.target_group_id,
+                            message_thread_id=thread_id,
+                            photo=to_media_input(image_urls[0]),
+                            caption=caption_text,
+                            parse_mode="HTML"
+                        )
+                except Exception as se:
+                    se_str = str(se).lower()
+                    if "video as photo" in se_str or "can't use file of type video as photo" in se_str:
+                        logger.info(f"Retrying auto-publish as video for item {item_id}...")
+                        msg = await bot.send_video(
+                            chat_id=config.target_group_id,
+                            message_thread_id=thread_id,
+                            video=to_media_input(image_urls[0]),
+                            caption=caption_text,
+                            parse_mode="HTML",
+                            supports_streaming=True
+                        )
+                    elif "photo as video" in se_str or "can't use file of type photo as video" in se_str:
+                        logger.info(f"Retrying auto-publish as photo for item {item_id}...")
+                        msg = await bot.send_photo(
+                            chat_id=config.target_group_id,
+                            message_thread_id=thread_id,
+                            photo=to_media_input(image_urls[0]),
+                            caption=caption_text,
+                            parse_mode="HTML"
+                        )
+                    else:
+                        raise
+
                 published_msg_id = msg.message_id
         else:
             # Без картинок — текстовое сообщение

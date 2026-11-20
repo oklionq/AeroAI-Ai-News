@@ -20,9 +20,41 @@ def to_media_input(src: str):
         return FSInputFile(src)
     return src
 
-def is_video(path: str) -> bool:
-    """Проверяет, является ли файл видео по расширению."""
-    return str(path).lower().endswith(('.mp4', '.mov', '.webm', '.mkv'))
+def is_video(media: any, fallback_url: str | None = None) -> bool:
+    """
+    Проверяет, является ли медиафайл видео:
+    - по расширению локального файла или URL (.mp4, .mov, .webm, .mkv, .avi)
+    - по оригинальному пути из fallback_url (если media - это Telegram file_id)
+    - по сигнатуре Telegram Bot API file_id (префиксы BA... или BQ...)
+    """
+    if not media:
+        return False
+        
+    s = str(media).strip()
+    lower = s.lower()
+    
+    # 1. Проверка расширения в самом значении
+    if lower.endswith(('.mp4', '.mov', '.webm', '.mkv', '.avi')):
+        return True
+    if lower.endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
+        return False
+        
+    # 2. Проверка по fallback_url
+    if fallback_url and isinstance(fallback_url, str):
+        fb_lower = fallback_url.lower()
+        if fb_lower.endswith(('.mp4', '.mov', '.webm', '.mkv', '.avi')):
+            return True
+        if fb_lower.endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
+            return False
+            
+    # 3. Проверка сигнатуры Telegram Bot API file_id
+    if len(s) > 30 and '/' not in s and '\\' not in s and not s.startswith("http"):
+        if s.startswith(('BA', 'BQ')):
+            return True
+        if s.startswith(('Ag', 'AQ')):
+            return False
+
+    return False
 
 # ---------------------------------------------------------------------------
 # Sending draft to admin (supports 0, 1, or 2+ photos)
@@ -419,15 +451,24 @@ async def on_review_action(callback: types.CallbackQuery, bot: Bot):
         
         caption_text = safe_caption(post_text, max_len=1024)
 
-        # Разрешаем медиа: отдаем приоритет Telegram file_id (работает независимо от диска сервера)
-        media_items = []
-        if image_file_ids:
-            media_items = [fid for fid in image_file_ids if fid]
-        elif image_urls:
-            # Проверяем, существуют ли локальные файлы на этом хосте
+        # Разрешаем медиа:
+        local_media = []
+        if image_urls:
             for u in image_urls:
                 if isinstance(u, str) and (os.path.exists(u) or u.startswith("http")):
-                    media_items.append(u)
+                    local_media.append(u)
+
+        stored_file_ids = [fid for fid in image_file_ids if fid] if image_file_ids else []
+
+        # Если есть локальные файлы и их не меньше, чем сохраненных file_id (полный альбом), используем их
+        if local_media and len(local_media) >= len(stored_file_ids):
+            media_items = local_media
+        elif stored_file_ids:
+            media_items = stored_file_ids
+        elif local_media:
+            media_items = local_media
+        else:
+            media_items = []
         
         # Если в базе нет медиа, но само сообщение в ЛС содержит фото или видео
         if not media_items:
@@ -438,6 +479,7 @@ async def on_review_action(callback: types.CallbackQuery, bot: Bot):
 
         try:
             published_msg_id = None
+            published_album_ids = []
             if media_items:
                 if len(media_items) >= 2:
                     # Публикуем альбом: текст прикреплён к ПЕРВОМУ элементу
@@ -445,7 +487,8 @@ async def on_review_action(callback: types.CallbackQuery, bot: Bot):
                     for i, m in enumerate(media_items[:4]):
                         cap = caption_text if i == 0 else None
                         pm = "HTML" if i == 0 else None
-                        if is_video(m):
+                        orig_u = image_urls[i] if i < len(image_urls) else None
+                        if is_video(m, fallback_url=orig_u):
                             media.append(InputMediaVideo(
                                 media=to_media_input(m),
                                 caption=cap,
@@ -458,31 +501,87 @@ async def on_review_action(callback: types.CallbackQuery, bot: Bot):
                                 caption=cap,
                                 parse_mode=pm
                             ))
-                    published_msgs = await bot.send_media_group(
-                        chat_id=config.target_group_id,
-                        message_thread_id=thread_id,
-                        media=media
-                    )
-                    published_msg_id = published_msgs[0].message_id
+                    try:
+                        published_msgs = await bot.send_media_group(
+                            chat_id=config.target_group_id,
+                            message_thread_id=thread_id,
+                            media=media
+                        )
+                        published_msg_id = published_msgs[0].message_id
+                        published_album_ids = [m.message_id for m in published_msgs]
+                    except Exception as album_err:
+                        err_str = str(album_err).lower()
+                        if "video as photo" in err_str:
+                            logger.warning(f"send_media_group failed with video-as-photo for item {item_id}, retrying with converted types...")
+                            retry_media = []
+                            for itm in media:
+                                if isinstance(itm, InputMediaPhoto):
+                                    retry_media.append(InputMediaVideo(
+                                        media=itm.media,
+                                        caption=itm.caption,
+                                        parse_mode=itm.parse_mode,
+                                        supports_streaming=True
+                                    ))
+                                else:
+                                    retry_media.append(itm)
+                            published_msgs = await bot.send_media_group(
+                                chat_id=config.target_group_id,
+                                message_thread_id=thread_id,
+                                media=retry_media
+                            )
+                            published_msg_id = published_msgs[0].message_id
+                            published_album_ids = [m.message_id for m in published_msgs]
+                        else:
+                            raise
                 else:
                     single_media = media_items[0]
-                    if is_video(single_media):
-                        published_msg = await bot.send_video(
-                            chat_id=config.target_group_id,
-                            message_thread_id=thread_id,
-                            video=to_media_input(single_media),
-                            caption=caption_text,
-                            parse_mode="HTML",
-                            supports_streaming=True
-                        )
-                    else:
-                        published_msg = await bot.send_photo(
-                            chat_id=config.target_group_id,
-                            message_thread_id=thread_id,
-                            photo=to_media_input(single_media),
-                            caption=caption_text,
-                            parse_mode="HTML"
-                        )
+                    orig_u = image_urls[0] if image_urls else None
+                    is_vid = is_video(single_media, fallback_url=orig_u)
+                    if not is_vid and callback.message.video and not callback.message.photo:
+                        is_vid = True
+
+                    try:
+                        if is_vid:
+                            published_msg = await bot.send_video(
+                                chat_id=config.target_group_id,
+                                message_thread_id=thread_id,
+                                video=to_media_input(single_media),
+                                caption=caption_text,
+                                parse_mode="HTML",
+                                supports_streaming=True
+                            )
+                        else:
+                            published_msg = await bot.send_photo(
+                                chat_id=config.target_group_id,
+                                message_thread_id=thread_id,
+                                photo=to_media_input(single_media),
+                                caption=caption_text,
+                                parse_mode="HTML"
+                            )
+                    except Exception as single_err:
+                        err_str = str(single_err).lower()
+                        if "video as photo" in err_str or "can't use file of type video as photo" in err_str:
+                            logger.info(f"Retrying single publication as video for item {item_id}...")
+                            published_msg = await bot.send_video(
+                                chat_id=config.target_group_id,
+                                message_thread_id=thread_id,
+                                video=to_media_input(single_media),
+                                caption=caption_text,
+                                parse_mode="HTML",
+                                supports_streaming=True
+                            )
+                        elif "photo as video" in err_str or "can't use file of type photo as video" in err_str:
+                            logger.info(f"Retrying single publication as photo for item {item_id}...")
+                            published_msg = await bot.send_photo(
+                                chat_id=config.target_group_id,
+                                message_thread_id=thread_id,
+                                photo=to_media_input(single_media),
+                                caption=caption_text,
+                                parse_mode="HTML"
+                            )
+                        else:
+                            raise
+
                     published_msg_id = published_msg.message_id
             else:
                 # Текстовое сообщение
@@ -498,14 +597,14 @@ async def on_review_action(callback: types.CallbackQuery, bot: Bot):
                 if row:
                     await db.execute("""
                         UPDATE news_items 
-                        SET status = 'published', decision_at = CURRENT_TIMESTAMP, telegram_message_id = ?
+                        SET status = 'published', decision_at = CURRENT_TIMESTAMP, telegram_message_id = ?, telegram_album_message_ids = ?
                         WHERE id = ?
-                    """, (published_msg_id, item_id))
+                    """, (published_msg_id, json.dumps(published_album_ids), item_id))
                 else:
                     await db.execute("""
-                        INSERT INTO news_items (id, source_id, url, url_hash, title_hash, title, summary, status, decision_at, telegram_message_id)
-                        VALUES (?, 1, ?, ?, ?, ?, ?, 'published', CURRENT_TIMESTAMP, ?)
-                    """, (item_id, url or f"https://t.me/{config.donor_channel}", f"manual_{item_id}", f"manual_{item_id}", post_text[:60], post_text, published_msg_id))
+                        INSERT INTO news_items (id, source_id, url, url_hash, title_hash, title, summary, status, decision_at, telegram_message_id, telegram_album_message_ids)
+                        VALUES (?, 1, ?, ?, ?, ?, ?, 'published', CURRENT_TIMESTAMP, ?, ?)
+                    """, (item_id, url or f"https://t.me/{config.donor_channel}", f"manual_{item_id}", f"manual_{item_id}", post_text[:60], post_text, published_msg_id, json.dumps(published_album_ids)))
                 await db.commit()
                 
             # Обновляем контрольное сообщение в ЛС (с защитой от превышения лимита caption 1024)
