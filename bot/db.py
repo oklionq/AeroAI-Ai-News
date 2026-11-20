@@ -5,8 +5,9 @@ from datetime import datetime, timezone
 from bot.config import config
 from bot.utils.logger import logger
 
-DB_PATH = config.database_url if config.database_url else os.path.join("data", "bot.db")
-BASE_DATA_DIR = os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else "data"
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = config.database_url if config.database_url else os.path.join(PROJECT_ROOT, "data", "bot.db")
+BASE_DATA_DIR = os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else os.path.join(PROJECT_ROOT, "data")
 TEMP_MEDIA_DIR = os.path.join(BASE_DATA_DIR, "temp_media")
 
 async def init_db():
@@ -172,6 +173,26 @@ async def log_error(component: str, message: str, news_item_id: int = None):
         """, (component, message, news_item_id))
         await db.commit()
     logger.error(f"[{component}] {message}")
+
+def cleanup_old_temp_media(max_age_days: int = 7):
+    """Удаляет временные медиафайлы старше max_age_days дней для предотвращения переполнения диска."""
+    import time
+    if not os.path.exists(TEMP_MEDIA_DIR):
+        return
+    now = time.time()
+    cutoff = now - (max_age_days * 86400)
+    removed_count = 0
+    for filename in os.listdir(TEMP_MEDIA_DIR):
+        file_path = os.path.join(TEMP_MEDIA_DIR, filename)
+        if os.path.isfile(file_path):
+            try:
+                if os.path.getmtime(file_path) < cutoff:
+                    os.remove(file_path)
+                    removed_count += 1
+            except Exception as e:
+                logger.warning(f"Could not remove old temp media {file_path}: {e}")
+    if removed_count > 0:
+        logger.info(f"Cleaned up {removed_count} old temp media files from {TEMP_MEDIA_DIR}.")
 
 def get_db_connection():
     return aiosqlite.connect(DB_PATH)

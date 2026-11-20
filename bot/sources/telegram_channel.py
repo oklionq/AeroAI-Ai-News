@@ -9,9 +9,7 @@ from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from bot.config import config
 from bot.utils.logger import logger
-
-BASE_DATA_DIR = os.path.dirname(config.database_url) if config.database_url else "data"
-TEMP_MEDIA_DIR = os.path.join(BASE_DATA_DIR, "temp_media")
+from bot.db import TEMP_MEDIA_DIR
 
 AD_MARKERS = [
     r"\berid[:\s]",
@@ -24,21 +22,24 @@ AD_MARKERS = [
 ]
 
 def is_ad_post(text: str) -> bool:
-    if not text:
-        return False
-    lower = text.lower()
-    for pattern in AD_MARKERS:
-        if re.search(pattern, lower):
-            return True
+    # Все посты канала-донора считаются полезными и направляются на премодерацию администратору
     return False
 
 def extract_title_and_summary(text: str) -> tuple[str, str]:
-    """Извлекает первую содержательную строку как title, остальное как summary."""
+    """Извлекает содержательный заголовок как title, весь текст как summary."""
     clean_text = text.strip() if text else ""
     if not clean_text:
         return ("Без текста", "")
     lines = [line.strip() for line in clean_text.split("\n") if line.strip()]
-    title = lines[0] if lines else "Новость из Telegram"
+    if not lines:
+        return ("Новость из Telegram", clean_text)
+    
+    # Если первая строка - эмодзи или короткий маркер (<= 4 символов), соединяем со следующей строкой
+    if len(lines[0]) <= 4 and len(lines) > 1:
+        title = f"{lines[0]} {lines[1]}"
+    else:
+        title = lines[0]
+
     if len(title) > 200:
         title = title[:197] + "..."
     return (title, clean_text)

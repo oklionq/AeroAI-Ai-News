@@ -126,9 +126,11 @@ async def _check_and_fix_grammar(post_html: str) -> str:
             temperature=0.1
         )
         fixed_title = grammar_resp.choices[0].message.content.strip() if grammar_resp.choices else ""
-        if fixed_title and fixed_title != full_title:
-            logger.info(f"Грамматическое исправление: '{full_title}' -> '{fixed_title}'")
-            return post_html.replace(f"<b>{full_title}</b>", f"<b>{fixed_title}</b>")
+        if fixed_title:
+            clean_fixed = re.sub(r'^(исправленный вариант|исправленный заголовок|исправление|вариант):\s*', '', fixed_title, flags=re.IGNORECASE).strip(' "\'')
+            if clean_fixed and clean_fixed != full_title:
+                logger.info(f"Грамматическое исправление: '{full_title}' -> '{clean_fixed}'")
+                return post_html.replace(f"<b>{full_title}</b>", f"<b>{clean_fixed}</b>")
     except Exception as e:
         logger.error(f"Grammar check error: {e}")
         

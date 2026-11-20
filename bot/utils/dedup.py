@@ -2,11 +2,17 @@ import re
 import hashlib
 
 def normalize_title(title: str) -> str:
-    title = title.lower()
-    title = re.sub(r'[^\w\s]', '', title)
+    if not title:
+        return ""
+    clean = title.lower()
+    clean_no_punct = re.sub(r'[^\w\s]', '', clean)
     stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
-    words = [w for w in title.split() if w not in stop_words]
-    return " ".join(words)
+    words = [w for w in clean_no_punct.split() if w not in stop_words]
+    res = " ".join(words).strip()
+    if not res:
+        # Fallback to stripped original lowercased so emoji-only doesn't collapse to empty string
+        return clean.strip()
+    return res
 
 def generate_hash(text: str) -> str:
     return hashlib.sha256(text.encode('utf-8')).hexdigest()

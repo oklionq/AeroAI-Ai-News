@@ -1,8 +1,9 @@
+import sys
 import asyncio
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bot.config import config
-from bot.db import init_db
+from bot.db import init_db, get_db_connection, cleanup_old_temp_media
 from bot.telegram.handlers import dp
 import bot.telegram.admin_commands
 from bot.pipeline.collector import run_collector
@@ -12,6 +13,22 @@ from bot.utils.logger import logger
 from bot.pipeline.cycle_tracker import CycleTracker
 
 async def tick(bot: Bot):
+    # Skip cycle if bot is paused
+    try:
+        async with get_db_connection() as db:
+            async with db.execute("SELECT is_paused FROM bot_state WHERE id = 1") as cur:
+                row = await cur.fetchone()
+                if row and row[0]:
+                    logger.info("Bot is paused. Skipping tick.")
+                    return
+    except Exception as e:
+        logger.error(f"Error checking pause status in tick: {e}")
+
+    try:
+        cleanup_old_temp_media()
+    except Exception as e:
+        logger.warning(f"Error cleaning up old media: {e}")
+
     try:
         tracker = await CycleTracker.start_cycle()
         try:

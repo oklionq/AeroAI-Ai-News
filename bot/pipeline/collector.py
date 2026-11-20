@@ -94,7 +94,7 @@ async def save_new_items(items: list[dict], tracker=None):
             is_stale = False
             pub_at = item.get("published_at")
             if not pub_at:
-                is_stale = True
+                pub_at = now_utc
             else:
                 if pub_at.tzinfo is None:
                     pub_at = pub_at.replace(tzinfo=timezone.utc)
@@ -107,47 +107,54 @@ async def save_new_items(items: list[dict], tracker=None):
                 continue
                 
             title_norm = normalize_title(title)
-            title_hash = generate_hash(title_norm)
+            title_hash = generate_hash(title_norm) if title_norm else ""
             url_hash = get_url_hash(url)
             
-            # Exact hash match
-            if title_hash in recent_title_hashes or url_hash in recent_url_hashes:
+            # Exact URL match
+            if url_hash in recent_url_hashes:
                 continue
                 
-            # Fuzzy title match
-            is_dup = False
-            for r_title_norm in recent_titles_norm:
-                if title_similarity(title_norm, r_title_norm) > 0.8:
-                    is_dup = True
-                    break
+            # Title dedup: only apply if no source_msg_id (e.g. non-Telegram sources)
+            if not source_msg_id:
+                if title_hash and len(title_norm) > 10 and title_hash in recent_title_hashes:
+                    continue
                     
-            if is_dup:
-                continue
+                is_dup = False
+                for r_title_norm in recent_titles_norm:
+                    if len(r_title_norm) > 10 and len(title_norm) > 10 and title_similarity(title_norm, r_title_norm) > 0.8:
+                        is_dup = True
+                        break
+                if is_dup:
+                    continue
                     
-            # Insert new item
+            # Insert new item directly as pending_generation (bypassing LLM filter)
             pub_str = pub_at.strftime("%Y-%m-%d %H:%M:%S") if pub_at else None
             await db.execute("""
                 INSERT INTO news_items (
                     source_id, url, url_hash, title_hash, title, summary, 
-                    published_at, image_urls, status, telegram_source_msg_id
+                    published_at, image_urls, status, telegram_source_msg_id,
+                    filter_category
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 item["source_id"], url, url_hash, title_hash, title, 
                 item["summary"], pub_str, item.get("image_urls", "[]"), 
-                "collected", source_msg_id
+                "pending_generation", source_msg_id, "other"
             ))
             
-            recent_title_hashes.add(title_hash)
+            if title_hash:
+                recent_title_hashes.add(title_hash)
             recent_url_hashes.add(url_hash)
             if source_msg_id:
                 recent_msg_ids.add(source_msg_id)
-            recent_titles_norm.append(title_norm)
+            if title_norm:
+                recent_titles_norm.append(title_norm)
             new_count += 1
             
         await db.commit()
         if tracker:
             await tracker.add_items_filtered_stale(stale_count)
             await tracker.add_items_after_dedup(new_count)
+            await tracker.add_items_passed_filter(new_count)
             
         logger.info(f"Collector finished. Inserted {new_count} new items (stale filtered: {stale_count}).")

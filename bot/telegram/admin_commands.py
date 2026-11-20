@@ -353,13 +353,15 @@ async def cmd_testpost(message: types.Message, bot: Bot):
     await message.answer("Создаю тестовый пост...")
     
     from bot.telegram.handlers import send_draft_to_admin
+    import time
     
-    test_title = "Тестовая новость для проверки публикации"
-    test_url = "https://example.com/test-news"
-    test_url_hash = "testhash123"
-    test_title_hash = "testhash123"
+    ts = int(time.time())
+    test_title = f"Тестовая новость для проверки публикации #{ts}"
+    test_url = f"https://example.com/test-news-{ts}"
+    test_url_hash = f"testhash_{ts}"
+    test_title_hash = f"testhash_{ts}"
     test_summary = "Это тестовое саммари новости."
-    test_post_text = "<b>Тестовая новость для проверки публикации</b>\n\nЭто сгенерированный тестовый текст. Если вы нажмете «Опубликовать», он должен попасть в нужную тему (например, AI Новости с ID 13)."
+    test_post_text = f"<b>Тестовая новость для проверки публикации</b>\n\nЭто сгенерированный тестовый текст ({ts}). Если вы нажмете «Опубликовать», он попадет в тему ID {config.default_topic_id}."
     
     async with get_db_connection() as db:
         async with db.execute("SELECT id FROM sources LIMIT 1") as cur:

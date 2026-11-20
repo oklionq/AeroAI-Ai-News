@@ -38,44 +38,32 @@ async def run_generator_stage(bot_instance, tracker=None):
             cyr_chars = len(re.findall(r'[а-яА-ЯёЁ]', text_no_html))
             alpha_chars = len(re.findall(r'[a-zA-Zа-яА-ЯёЁ]', text_no_html))
             return cyr_chars / alpha_chars if alpha_chars > 0 else 1.0
-            
-        def has_hallucinated_year(text, pub_date_str):
-            years = re.findall(r'\b(20\d{2})\b', text)
-            if not years:
-                return False
-            try:
-                pub_year = datetime.datetime.fromisoformat(pub_date_str).year if pub_date_str else datetime.datetime.utcnow().year
-            except:
-                pub_year = datetime.datetime.utcnow().year
-            current_year = datetime.datetime.utcnow().year
-            for y_str in years:
-                y = int(y_str)
-                if y != pub_year and y != current_year:
-                    return True
-            return False
 
-        def is_invalid(p):
-            return (
-                "<b>" not in p.post_html or 
-                "<blockquote>" not in p.post_html or 
-                get_cyrillic_ratio(p.post_html) < 0.55 or 
-                has_hallucinated_year(p.post_html, pub_date_str) or 
-                len(p.post_html) > 950
-            )
+        def needs_retry(p):
+            if not p or not p.post_html:
+                return True
+            return "<b>" not in p.post_html or get_cyrillic_ratio(p.post_html) < 0.45
 
         # Generate text
         post = await generate_post_text(title, summary, source_name, item_id, url, category=category)
-        if post and is_invalid(post):
-            logger.warning(f"Formatting/Language failed for {item_id}, retrying...")
-            post = await generate_post_text(title, summary, source_name, item_id, url, retry_format=True, category=category)
-            if post and is_invalid(post):
-                logger.error(f"Formatting/Language retry failed for {item_id}")
-                post = None
-                
-        if post:
+        if post and needs_retry(post):
+            logger.warning(f"Formatting/Language suboptimal for {item_id}, retrying once...")
+            post_retry = await generate_post_text(title, summary, source_name, item_id, url, retry_format=True, category=category)
+            if post_retry and post_retry.post_html:
+                post = post_retry
+
+        if post and post.post_html:
+            # Guarantee <b> tag on header if missing
+            if "<b>" not in post.post_html:
+                parts = post.post_html.strip().split("\n\n", 1)
+                if len(parts) == 2:
+                    post.post_html = f"<b>{parts[0]}</b>\n\n{parts[1]}"
+                else:
+                    post.post_html = f"<b>{post.post_html}</b>"
+
             post.post_html = re.sub(r'<blockquote>\s+', '<blockquote>', post.post_html)
             post.post_html = re.sub(r'\s+</blockquote>', '</blockquote>', post.post_html)
-        if not post:
+        else:
             async with get_db_connection() as db:
                 await db.execute("UPDATE news_items SET status = 'error' WHERE id = ?", (item_id,))
                 await db.commit()

@@ -98,8 +98,27 @@ async def send_draft_to_admin(bot: Bot, item_id: int, post_text: str, image_urls
         await send_draft_to_admin(bot, item_id, post_text, image_urls)
     except Exception as e:
         logger.error(f"Failed to send draft for item {item_id}: {e}", exc_info=True)
-        # fallback: retry without images
-        if image_urls:
+        err_str = str(e).lower()
+        if "can't parse entities" in err_str:
+            # Fallback: send as plain text without broken HTML tags
+            clean_text = re.sub(r'<[^>]+>', '', post_text)
+            try:
+                control_msg = await bot.send_message(
+                    chat_id=config.admin_chat_id,
+                    text=clean_text[:4096],
+                    reply_markup=markup
+                )
+                async with get_db_connection() as db:
+                    await db.execute(
+                        "UPDATE news_items SET telegram_control_message_id = ? WHERE id = ?",
+                        (control_msg.message_id, item_id)
+                    )
+                    await db.commit()
+                return
+            except Exception as e2:
+                logger.error(f"Fallback plain text failed for {item_id}: {e2}")
+        elif image_urls:
+            # fallback: retry without images
             await send_draft_to_admin(bot, item_id, post_text, [])
 
 
@@ -339,22 +358,34 @@ async def on_review_action(callback: types.CallbackQuery, bot: Bot):
     
     async with get_db_connection() as db:
         async with db.execute("""
-            SELECT status, post_text_json, image_urls, image_file_ids, filter_category, url
+            SELECT status, post_text_json, image_urls, image_file_ids, filter_category, url, telegram_message_id
             FROM news_items WHERE id = ?
         """, (item_id,)) as cur:
             row = await cur.fetchone()
             
-    if not row:
-        await callback.answer("Новость не найдена", show_alert=True)
-        return
+    if row:
+        status, post_text, image_urls_json, image_file_ids_json, category, url, existing_pub_id = row
+    else:
+        status = None
+        post_text = None
+        image_urls_json = "[]"
+        image_file_ids_json = "[]"
+        category = "other"
+        url = ""
+        existing_pub_id = None
         
-    status, post_text, image_urls_json, image_file_ids_json, category, url = row
-    
-    if status != 'pending_review':
-        await callback.answer("Уже обработано", show_alert=True)
+    # Блокируем только если пост ДЕЙСТВИТЕЛЬНО уже опубликован в канал
+    if status == 'published' and existing_pub_id:
+        await callback.answer("Этот пост уже опубликован в приватную группу!", show_alert=True)
         return
 
-    # Parse JSON fields
+    # Если текста нет в БД (например, после перезапуска контейнера), берем его прямо из сообщения Telegram
+    if not post_text:
+        msg_text = callback.message.caption or callback.message.text or ""
+        # Очищаем от возможных системных пометок
+        post_text = re.sub(r'\n\n📸 В посте \d+ медиа \(будут опубликованы вместе\)', '', msg_text).strip()
+
+    # Парсим медиа
     try:
         image_urls = json.loads(image_urls_json) if image_urls_json else []
     except (json.JSONDecodeError, TypeError):
@@ -383,32 +414,47 @@ async def on_review_action(callback: types.CallbackQuery, bot: Bot):
             
     elif action == "approve":
         thread_id = config.topic_mapping.get(category, None)
-        
         if thread_id is None:
             thread_id = config.default_topic_id
-            logger.info(f"Категория '{category}' не найдена в TOPIC_MAPPING. Используем DEFAULT_TOPIC_ID ({thread_id}).")
         
         caption_text = safe_caption(post_text, max_len=1024)
 
+        # Разрешаем медиа: отдаем приоритет Telegram file_id (работает независимо от диска сервера)
+        media_items = []
+        if image_file_ids:
+            media_items = [fid for fid in image_file_ids if fid]
+        elif image_urls:
+            # Проверяем, существуют ли локальные файлы на этом хосте
+            for u in image_urls:
+                if isinstance(u, str) and (os.path.exists(u) or u.startswith("http")):
+                    media_items.append(u)
+        
+        # Если в базе нет медиа, но само сообщение в ЛС содержит фото или видео
+        if not media_items:
+            if callback.message.photo:
+                media_items.append(callback.message.photo[-1].file_id)
+            elif callback.message.video:
+                media_items.append(callback.message.video.file_id)
+
         try:
             published_msg_id = None
-            if image_urls:
-                if len(image_urls) >= 2:
-                    # Публикуем альбом: текст прикреплён к ПЕРВОМУ элементу (единый пост)
+            if media_items:
+                if len(media_items) >= 2:
+                    # Публикуем альбом: текст прикреплён к ПЕРВОМУ элементу
                     media = []
-                    for i, u in enumerate(image_urls[:4]):
+                    for i, m in enumerate(media_items[:4]):
                         cap = caption_text if i == 0 else None
                         pm = "HTML" if i == 0 else None
-                        if is_video(u):
+                        if is_video(m):
                             media.append(InputMediaVideo(
-                                media=to_media_input(u),
+                                media=to_media_input(m),
                                 caption=cap,
                                 parse_mode=pm,
                                 supports_streaming=True
                             ))
                         else:
                             media.append(InputMediaPhoto(
-                                media=to_media_input(u),
+                                media=to_media_input(m),
                                 caption=cap,
                                 parse_mode=pm
                             ))
@@ -419,12 +465,12 @@ async def on_review_action(callback: types.CallbackQuery, bot: Bot):
                     )
                     published_msg_id = published_msgs[0].message_id
                 else:
-                    # Одиночное медиа (видео или фото) с текстом в caption
-                    if is_video(image_urls[0]):
+                    single_media = media_items[0]
+                    if is_video(single_media):
                         published_msg = await bot.send_video(
                             chat_id=config.target_group_id,
                             message_thread_id=thread_id,
-                            video=to_media_input(image_urls[0]),
+                            video=to_media_input(single_media),
                             caption=caption_text,
                             parse_mode="HTML",
                             supports_streaming=True
@@ -433,37 +479,47 @@ async def on_review_action(callback: types.CallbackQuery, bot: Bot):
                         published_msg = await bot.send_photo(
                             chat_id=config.target_group_id,
                             message_thread_id=thread_id,
-                            photo=to_media_input(image_urls[0]),
+                            photo=to_media_input(single_media),
                             caption=caption_text,
                             parse_mode="HTML"
                         )
                     published_msg_id = published_msg.message_id
             else:
-                # Без картинок — текстовое сообщение
+                # Текстовое сообщение
                 published_msg = await bot.send_message(
                     chat_id=config.target_group_id,
                     message_thread_id=thread_id,
                     text=safe_format(post_text, max_len=4096),
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
+                    parse_mode="HTML"
                 )
                 published_msg_id = published_msg.message_id
                 
             async with get_db_connection() as db:
-                await db.execute("""
-                    UPDATE news_items 
-                    SET status = 'published', decision_at = CURRENT_TIMESTAMP, telegram_message_id = ?
-                    WHERE id = ?
-                """, (published_msg_id, item_id))
+                if row:
+                    await db.execute("""
+                        UPDATE news_items 
+                        SET status = 'published', decision_at = CURRENT_TIMESTAMP, telegram_message_id = ?
+                        WHERE id = ?
+                    """, (published_msg_id, item_id))
+                else:
+                    await db.execute("""
+                        INSERT INTO news_items (id, source_id, url, url_hash, title_hash, title, summary, status, decision_at, telegram_message_id)
+                        VALUES (?, 1, ?, ?, ?, ?, ?, 'published', CURRENT_TIMESTAMP, ?)
+                    """, (item_id, url or f"https://t.me/{config.donor_channel}", f"manual_{item_id}", f"manual_{item_id}", post_text[:60], post_text, published_msg_id))
                 await db.commit()
                 
-            # Обновляем контрольное сообщение в ЛС
-            if callback.message.caption:
-                await callback.message.edit_caption(caption=callback.message.caption + "\n\n✅ Опубликовано в канал")
-            else:
-                await callback.message.edit_text(text=callback.message.text + "\n\n✅ Опубликовано в канал")
+            # Обновляем контрольное сообщение в ЛС (с защитой от превышения лимита caption 1024)
+            tag = "\n\n✅ Опубликовано в приватную группу"
+            try:
+                if callback.message.caption:
+                    new_cap = safe_caption(callback.message.caption, max_len=1024 - len(tag)) + tag
+                    await callback.message.edit_caption(caption=new_cap, reply_markup=None)
+                else:
+                    await callback.message.edit_text(text=callback.message.text + tag, reply_markup=None)
+            except Exception as em:
+                logger.warning(f"Could not edit message markup in PM: {em}")
                 
-            await callback.answer("Опубликовано!")
+            await callback.answer("✅ Успешно опубликовано в приватную группу!", show_alert=True)
             
         except Exception as e:
             logger.error(f"Publishing failed for item {item_id}: {e}", exc_info=True)
@@ -493,9 +549,11 @@ async def on_reject_reason(callback: types.CallbackQuery):
     }
     
     reason_title = reason_map.get(reason, reason)
+    tag = f"\n\n❌ Отклонено ({reason_title})"
     if callback.message.caption:
-        await callback.message.edit_caption(caption=callback.message.caption + f"\n\n❌ Отклонено ({reason_title})")
+        new_cap = safe_caption(callback.message.caption, max_len=1024 - len(tag)) + tag
+        await callback.message.edit_caption(caption=new_cap, reply_markup=None)
     else:
-        await callback.message.edit_text(text=callback.message.text + f"\n\n❌ Отклонено ({reason_title})")
+        await callback.message.edit_text(text=callback.message.text + tag, reply_markup=None)
         
     await callback.answer(f"Отклонено: {reason_title}")

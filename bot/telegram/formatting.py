@@ -1,6 +1,7 @@
 import re
 
 def safe_format(text: str, max_len: int = 4096) -> str:
+    """Безопасно обрезает длинный текст для обычного текстового сообщения Telegram (до 4096 символов)."""
     if len(text) <= max_len:
         return text
         
@@ -8,17 +9,19 @@ def safe_format(text: str, max_len: int = 4096) -> str:
     allowed_len = max_len - len(trunc_mark)
     truncated = text[:allowed_len]
     
-    # Close open tags
-    for tag in ['b', 'i', 'u', 's', 'code', 'pre', 'blockquote', 'a']:
-        if truncated.count(f'<{tag}') > truncated.count(f'</{tag}>'):
-            truncated += f'</{tag}>'
+    # Закрываем теги в порядке LIFO, избегая ложного совпадения <b на <blockquote
+    for tag in ['pre', 'code', 'blockquote', 'a', 'u', 's', 'i', 'b']:
+        open_count = len(re.findall(rf'<{tag}[> ]', truncated))
+        close_count = len(re.findall(rf'</{tag}>', truncated))
+        if open_count > close_count:
+            truncated += f'</{tag}>' * (open_count - close_count)
             
     return truncated + trunc_mark
 
 def safe_caption(text: str, max_len: int = 1024) -> str:
     """
     Гарантирует, что текст поста укладывается в строгий лимит caption Telegram (1024 символа).
-    Корректно закрывает открытые HTML-теги.
+    Обрезает по границе слов и корректно закрывает открытые HTML-теги.
     """
     if len(text) <= max_len:
         return text
@@ -32,11 +35,11 @@ def safe_caption(text: str, max_len: int = 1024) -> str:
     if last_space > 0:
         truncated = truncated[:last_space]
     
-    # Корректно закрываем открытые теги
-    for tag in ['b', 'i', 'u', 's', 'code', 'pre', 'blockquote', 'a']:
+    # Закрываем теги в порядке LIFO, избегая ложного совпадения <b на <blockquote
+    for tag in ['pre', 'code', 'blockquote', 'a', 'u', 's', 'i', 'b']:
         open_count = len(re.findall(rf'<{tag}[> ]', truncated))
         close_count = len(re.findall(rf'</{tag}>', truncated))
         if open_count > close_count:
-            truncated += f'</{tag}>'
+            truncated += f'</{tag}>' * (open_count - close_count)
             
     return truncated + "..."
